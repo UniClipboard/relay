@@ -34,6 +34,28 @@ For container environments, `UC_RELAY_TOKEN` may be used instead of a file. Pref
 that injects the value at process start. Other settings can be supplied through
 `UC_RELAY_BIND`, `UC_RELAY_TOKEN_FILE`, and `UC_RELAY_METRICS_BIND`.
 
+## Run with Docker
+
+The published image supports both AMD64 and ARM64:
+
+```sh
+export UC_RELAY_TOKEN="$(openssl rand -hex 32)"
+printf 'Relay token: %s\n' "$UC_RELAY_TOKEN"
+
+docker run --detach \
+  --name uniclipboard-relay \
+  --publish 3340:3340 \
+  --env UC_RELAY_TOKEN \
+  ghcr.io/uniclipboard/relay:latest
+```
+
+To use a credential file instead, mount an owner-only file that is readable by user `10001` in the
+container and set `UC_RELAY_TOKEN_FILE` to its mounted path.
+
+The image runs as an unprivileged user and includes a health check at `/healthz`. Every push to
+`main` publishes `latest` and a commit tag. Tags such as `v0.1.0` additionally publish `0.1.0` and
+`0.1`.
+
 The server listens only on localhost by default. The local relay URL is `http://127.0.0.1:3340`.
 Production deployments should expose an HTTPS URL and terminate TLS in a reverse proxy. The proxy
 must preserve the `Authorization` header and support WebSocket upgrades. If browser clients are
@@ -45,6 +67,7 @@ enabled, redact the `token` query parameter from proxy access logs.
 cargo fmt --check
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
+docker build --tag uniclipboard-relay:local .
 ```
 
 ## License

@@ -38,8 +38,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("relay server did not report a listening address")?;
     tracing::info!(%address, "relay is ready");
 
-    tokio::signal::ctrl_c().await?;
+    shutdown_signal().await?;
     tracing::info!("shutdown requested");
     server.shutdown().await?;
     Ok(())
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> Result<(), std::io::Error> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        _ = terminate.recv() => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> Result<(), std::io::Error> {
+    tokio::signal::ctrl_c().await
 }

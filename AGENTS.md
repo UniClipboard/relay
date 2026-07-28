@@ -5,7 +5,8 @@ This is an independent Rust repository under the UniClipboard umbrella workspace
 ## Commands
 
 Run `cargo fmt --check`, `cargo test`, and
-`cargo clippy --all-targets --all-features -- -D warnings` before committing.
+`cargo clippy --all-targets --all-features -- -D warnings` before committing. Changes to container
+packaging must also pass a local image build and health check.
 
 ## Architecture
 
