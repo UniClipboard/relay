@@ -30,6 +30,16 @@ Start the relay:
 cargo run --release -- --bind 127.0.0.1:3340 --token-file relay.token
 ```
 
+For a local simulator run only, an explicitly enabled loopback listener may allow access without a
+token:
+
+```sh
+cargo run -- --bind 127.0.0.1:3340 --allow-unauthenticated-local
+```
+
+This mode refuses non-loopback bind addresses. All normal starts, including Docker deployments,
+continue to require `UC_RELAY_TOKEN` or `UC_RELAY_TOKEN_FILE`.
+
 For container environments, `UC_RELAY_TOKEN` may be used instead of a file. Prefer a secret manager
 that injects the value at process start. Other settings can be supplied through
 `UC_RELAY_BIND`, `UC_RELAY_TOKEN_FILE`, and `UC_RELAY_METRICS_BIND`.

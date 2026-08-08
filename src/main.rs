@@ -1,9 +1,9 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf};
 
 use clap::Parser;
-use iroh_relay::server::{RelayConfig, Server, ServerConfig};
+use iroh_relay::server::{Server, ServerConfig};
 use tracing_subscriber::EnvFilter;
-use uniclipboard_relay::load_access;
+use uniclipboard_relay::relay_config;
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -13,6 +13,9 @@ struct Args {
 
     #[arg(long, env = "UC_RELAY_TOKEN_FILE")]
     token_file: Option<PathBuf>,
+
+    #[arg(long, env = "UC_RELAY_ALLOW_UNAUTHENTICATED_LOCAL")]
+    allow_unauthenticated_local: bool,
 
     #[arg(long, env = "UC_RELAY_METRICS_BIND")]
     metrics_bind: Option<SocketAddr>,
@@ -25,9 +28,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
-    let access = load_access(args.token_file.as_deref())?;
-    let mut relay = RelayConfig::new(args.bind);
-    relay.access = Arc::new(access);
+    let relay = relay_config(
+        args.bind,
+        args.token_file.as_deref(),
+        args.allow_unauthenticated_local,
+    )?;
 
     let mut server_config = ServerConfig::default();
     server_config.relay = Some(relay);

@@ -82,6 +82,8 @@ pub enum TokenError {
 pub enum AccessLoadError {
     #[error("no access token configured; set --token-file or {TOKEN_ENV}")]
     Missing,
+    #[error("unauthenticated relay mode requires a loopback bind address")]
+    UnauthenticatedRequiresLoopback,
     #[error("failed to open access token file {path}")]
     Open {
         path: PathBuf,

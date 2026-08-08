@@ -6,7 +6,7 @@ use iroh_relay::{
     server::{RelayConfig, Server, ServerConfig},
     tls::{CaRootsConfig, default_provider},
 };
-use uniclipboard_relay::TokenAccess;
+use uniclipboard_relay::{AccessLoadError, TokenAccess, relay_config};
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 const WRONG_TOKEN: &str = "fedcba9876543210fedcba9876543210";
@@ -29,6 +29,31 @@ async fn relay_rejects_missing_or_wrong_tokens_and_accepts_the_configured_token(
 
     drop(client);
     server.shutdown().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn local_unauthenticated_mode_accepts_a_client_without_a_token() {
+    let relay = relay_config((std::net::Ipv4Addr::LOCALHOST, 0).into(), None, true)
+        .expect("loopback relay may opt into unauthenticated mode");
+    let mut server_config = ServerConfig::default();
+    server_config.relay = Some(relay);
+    let server = Server::spawn(server_config).await.expect("start relay");
+    let relay_url = server.http_url().expect("relay URL");
+
+    let client = connect(&relay_url, None)
+        .await
+        .expect("local unauthenticated relay should accept a client without a token");
+
+    drop(client);
+    server.shutdown().await.expect("clean shutdown");
+}
+
+#[test]
+fn unauthenticated_mode_rejects_non_loopback_listeners() {
+    assert!(matches!(
+        relay_config("0.0.0.0:3340".parse().expect("socket address"), None, true),
+        Err(AccessLoadError::UnauthenticatedRequiresLoopback)
+    ));
 }
 
 async fn connect(relay_url: &RelayUrl, token: Option<&str>) -> Result<Client, ConnectError> {
