@@ -91,6 +91,8 @@ A process upgrade closes active connections. Clients must reconnect. A policy up
 
 The publication workflow builds AMD64 and ARM64 images at `ghcr.io/uniclipboard/relay` and `ghcr.io/uniclipboard/relay-gateway`. Pushes to `main` publish `latest` and a commit tag. Version tags also publish version and major/minor tags. Publishing images does not update a running server.
 
+Each build pushes an inspectable `sha-<commit>-amd64` or `sha-<commit>-arm64` tag, using the first seven characters of the commit SHA. The publication job checks both source tags before merging them. It verifies every published tag contains both Linux architectures, then pulls each platform and checks its image configuration. The job retains publication evidence for seven days, including the full commit SHA, workflow run, source manifests, published manifests, pull results, and final status. Both image publication jobs must pass before the release is considered published. A failed run can leave partial tags in the registry; do not deploy them.
+
 ## Configuration
 
 | Setting | Default | Owner |
