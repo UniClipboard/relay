@@ -48,7 +48,10 @@ while IFS= read -r tag; do
   baseline="$ARTIFACT_DIR/$name.json"
   for arch in amd64 arm64; do
     docker pull --platform "linux/$arch" "$tag" 2>&1 | tee "$ARTIFACT_DIR/$name-$arch-pull.log"
-    docker image inspect --platform "linux/$arch" "$tag" > "$ARTIFACT_DIR/$name-$arch-image.json"
+    manifest=$(jq -er --arg arch "$arch" '.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch) | .digest' "$ARTIFACT_DIR/$name.json")
+    docker buildx imagetools inspect --raw "$IMAGE_NAME@$manifest" > "$ARTIFACT_DIR/$name-$arch-manifest.json"
+    config=$(jq -er '.config.digest' "$ARTIFACT_DIR/$name-$arch-manifest.json")
+    docker image inspect "$config" > "$ARTIFACT_DIR/$name-$arch-image.json"
     jq -e --arg arch "$arch" 'length == 1 and .[0].Os == "linux" and .[0].Architecture == $arch' \
       "$ARTIFACT_DIR/$name-$arch-image.json" > "$ARTIFACT_DIR/$name-$arch-result.txt"
   done
