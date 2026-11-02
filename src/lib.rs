@@ -1,30 +1,20 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 pub mod auth;
 
+use iroh_relay::server::RelayConfig;
 use std::{net::SocketAddr, sync::Arc};
 
-use iroh_relay::server::{AllowAll, RelayConfig};
+pub use auth::GatewayAccess;
 
-pub use auth::{AccessLoadError, TokenAccess, TokenError, load_access};
-
-/// Builds relay access configuration while keeping unauthenticated mode local-only.
+/// Builds an upstream relay whose access decisions belong to the Go gateway.
 ///
 /// # Errors
-///
-/// Returns an error when unauthenticated mode is used with a non-loopback listener or when the
-/// configured token cannot be loaded.
+/// Returns an error when the private gateway URL is invalid.
 pub fn relay_config(
     bind: SocketAddr,
-    token_file: Option<&std::path::Path>,
-    allow_unauthenticated_local: bool,
-) -> Result<RelayConfig, AccessLoadError> {
+    gateway_url: &str,
+) -> Result<RelayConfig, Box<dyn std::error::Error + Send + Sync>> {
     let mut relay = RelayConfig::new(bind);
-    if allow_unauthenticated_local {
-        if !bind.ip().is_loopback() {
-            return Err(AccessLoadError::UnauthenticatedRequiresLoopback);
-        }
-        relay.access = Arc::new(AllowAll);
-    } else {
-        relay.access = Arc::new(load_access(token_file)?);
-    }
+    relay.access = Arc::new(GatewayAccess::new(gateway_url)?);
     Ok(relay)
 }

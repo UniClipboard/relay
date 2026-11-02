@@ -1,0 +1,31 @@
+name: Verify gateway and relay
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.91
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: gateway/go.mod
+          cache-dependency-path: gateway/go.sum
+      - name: Verify real relay clients
+        run: ./scripts/verify.sh
+      - name: Build images and verify Compose
+        run: ./scripts/verify-compose.sh
+      - name: Retain acceptance artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: relay-acceptance
+          path: artifacts/
+          retention-days: 7

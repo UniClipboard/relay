@@ -1,0 +1,53 @@
+services:
+  gateway:
+    image: ghcr.io/uniclipboard/relay-gateway:${UC_RELAY_IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    user: "${UC_RELAY_UID:-10001}:${UC_RELAY_GID:-10001}"
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    ports:
+      - "${UC_RELAY_PUBLISH_ADDRESS:-127.0.0.1}:3340:3340"
+    environment:
+      UC_GATEWAY_MODE: ${UC_GATEWAY_MODE:-static}
+      UC_RELAY_UPSTREAM: http://relay:3340
+      UC_GATEWAY_INTERNAL_BIND: :3341
+      UC_RELAY_TOKEN_FILE: ${UC_RELAY_TOKEN_FILE-/run/secrets/relay-credential}
+      UC_RELAY_MANAGEMENT_FILE: ${UC_RELAY_MANAGEMENT_FILE:-}
+      UC_RELAY_NODE_ID: ${UC_RELAY_NODE_ID:-}
+      UC_CLOUD_URL: ${UC_CLOUD_URL:-https://cloud.uniclipboard.app}
+    secrets:
+      - relay-credential
+    networks: [public, relay-internal]
+    depends_on:
+      relay:
+        condition: service_healthy
+
+  relay:
+    image: ghcr.io/uniclipboard/relay:${UC_RELAY_IMAGE_TAG:-latest}
+    build:
+      context: .
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      UC_RELAY_BIND: 0.0.0.0:3340
+      UC_RELAY_GATEWAY_URL: http://gateway:3341
+      # Upstream debug logs can contain client URLs. Keep production logs at info.
+      RUST_LOG: info
+    networks: [relay-internal]
+
+networks:
+  public: {}
+  relay-internal:
+    internal: true
+
+secrets:
+  relay-credential:
+    file: ${UC_RELAY_CREDENTIAL_PATH:-./secrets/relay.token}
