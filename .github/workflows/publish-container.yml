@@ -21,15 +21,23 @@ env:
 
 jobs:
   build:
-    name: Build ${{ matrix.platform }}
+    name: Build ${{ matrix.image }} ${{ matrix.platform }}
     strategy:
       fail-fast: false
       matrix:
+        image: [relay, relay-gateway]
+        platform: [linux/amd64, linux/arm64]
         include:
           - platform: linux/amd64
             runner: ubuntu-22.04
           - platform: linux/arm64
             runner: ubuntu-22.04-arm
+          - image: relay
+            dockerfile: Dockerfile
+          - image: relay-gateway
+            dockerfile: gateway/Dockerfile
+    env:
+      IMAGE_NAME: ghcr.io/uniclipboard/${{ matrix.image }}
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Sanitize platform name
@@ -55,6 +63,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
+          file: ${{ matrix.dockerfile }}
           platforms: ${{ matrix.platform }}
           labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache-${{ env.PLATFORM_PAIR }}
@@ -70,13 +79,18 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@v7
         with:
-          name: digests-${{ env.PLATFORM_PAIR }}
+          name: digests-${{ matrix.image }}-${{ env.PLATFORM_PAIR }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
           retention-days: 1
 
   publish:
-    name: Publish manifest
+    name: Publish ${{ matrix.image }} manifest
+    strategy:
+      matrix:
+        image: [relay, relay-gateway]
+    env:
+      IMAGE_NAME: ghcr.io/uniclipboard/${{ matrix.image }}
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -84,7 +98,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: ${{ runner.temp }}/digests
-          pattern: digests-*
+          pattern: digests-${{ matrix.image }}-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
@@ -111,9 +125,14 @@ jobs:
       - name: Create and push manifest
         working-directory: ${{ runner.temp }}/digests
         run: |
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.IMAGE_NAME }}@sha256:%s ' *)
+          args=()
+          while IFS= read -r tag; do
+            args+=(-t "$tag")
+          done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          for digest in *; do
+            args+=("${IMAGE_NAME}@sha256:${digest}")
+          done
+          docker buildx imagetools create "${args[@]}"
 
       - name: Inspect published image
         run: docker buildx imagetools inspect "${IMAGE_NAME}:${{ steps.meta.outputs.version }}"

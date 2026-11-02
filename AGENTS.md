@@ -1,12 +1,14 @@
 # Repository Guidelines
 
-This is an independent Rust repository under the UniClipboard umbrella workspace.
+This repository contains a Rust relay adapter and a Go gateway under the UniClipboard umbrella workspace.
 
 ## Commands
 
 Run `cargo fmt --check`, `cargo test`, and
 `cargo clippy --all-targets --all-features -- -D warnings` before committing. Changes to container
 packaging must also pass a local image build and health check.
+Run `./scripts/verify.sh` for the full-stack gateway acceptance suite and `./scripts/verify-compose.sh`
+for both image builds, Compose health, and real client forwarding.
 
 ## Architecture
 

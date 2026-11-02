@@ -1,4 +1,5 @@
-use std::{net::SocketAddr, path::PathBuf};
+// SPDX-License-Identifier: AGPL-3.0-only
+use std::net::SocketAddr;
 
 use clap::Parser;
 use iroh_relay::server::{Server, ServerConfig};
@@ -11,28 +12,25 @@ struct Args {
     #[arg(long, env = "UC_RELAY_BIND", default_value = "127.0.0.1:3340")]
     bind: SocketAddr,
 
-    #[arg(long, env = "UC_RELAY_TOKEN_FILE")]
-    token_file: Option<PathBuf>,
-
-    #[arg(long, env = "UC_RELAY_ALLOW_UNAUTHENTICATED_LOCAL")]
-    allow_unauthenticated_local: bool,
+    #[arg(
+        long,
+        env = "UC_RELAY_GATEWAY_URL",
+        default_value = "http://gateway:3341"
+    )]
+    gateway_url: String,
 
     #[arg(long, env = "UC_RELAY_METRICS_BIND")]
     metrics_bind: Option<SocketAddr>,
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
     let args = Args::parse();
-    let relay = relay_config(
-        args.bind,
-        args.token_file.as_deref(),
-        args.allow_unauthenticated_local,
-    )?;
+    let relay = relay_config(args.bind, &args.gateway_url)?;
 
     let mut server_config = ServerConfig::default();
     server_config.relay = Some(relay);

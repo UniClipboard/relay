@@ -2,3 +2,7 @@
 /.env
 *.token
 *.secret
+/secrets/
+/artifacts/
+/.planning/
+/gateway/uniclipboard-gateway
