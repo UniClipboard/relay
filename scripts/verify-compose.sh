@@ -35,6 +35,10 @@ docker compose -p "$project" -f compose.yaml -f "$override" up --detach --wait -
 docker compose -p "$project" -f compose.yaml -f "$override" ps --format json > "$artifact/containers.jsonl"
 address="$(docker compose -p "$project" -f compose.yaml -f "$override" port gateway 3340)"
 curl --fail --silent --show-error "http://$address/healthz" > "$artifact/health.txt"
+# Probe the published gateway port without client credentials.
+status="$(curl --silent --show-error --max-time 10 --output "$artifact/ping-body.txt" --dump-header "$artifact/ping-headers.txt" --write-out '%{http_code}' "http://$address/ping")"
+printf '%s\n' "$status" > "$artifact/ping-status.txt"
+[ "$status" = 200 ] && [ ! -s "$artifact/ping-body.txt" ]
 # Run real upstream clients against the published container port.
 cargo build --locked --example relay_probe > "$artifact/probe-build.log" 2>&1
 ./target/debug/examples/relay_probe "http://$address" "$credential" forward > "$artifact/forward.txt"

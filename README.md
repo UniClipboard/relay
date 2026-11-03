@@ -80,6 +80,8 @@ Terminate TLS at an external reverse proxy. Preserve the `Authorization` header 
 
 The gateway health check succeeds when static authentication is configured or a Cloud policy is fresh. The relay health check requests the upstream `/healthz` route. Relay health alone does not prove that clients can authenticate.
 
+The gateway forwards unauthenticated `GET /ping` latency probes to upstream `iroh-relay`. The upstream returns HTTP 200 with an empty body. Iroh clients use this probe to measure relay latency and select a relay. The `/generate_204` probe returns HTTP 204. Probe success does not prove that a client can authenticate or forward data.
+
 For published images, set `UC_RELAY_IMAGE_TAG` to the same immutable `sha-<commit>` tag for both containers. Then run:
 
 ```sh
@@ -131,7 +133,7 @@ To verify both images and Compose health, also run:
 ./scripts/verify-compose.sh
 ```
 
-The tests cover valid and invalid credentials, endpoint binding, policy changes, limits, outages, telemetry retry, and real datagram forwarding. Local fixture acceptance does not prove compatibility with the live Cloud deployment.
+The tests cover unauthenticated latency probes in static mode and before Cloud policy loading, valid and invalid credentials, endpoint binding, policy changes, limits, outages, telemetry retry, and real datagram forwarding. Compose acceptance also checks `/ping` through the published gateway port and records its status, headers, and body. Local fixture acceptance does not prove compatibility with the live Cloud deployment.
 
 ## License
 

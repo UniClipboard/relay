@@ -158,6 +158,51 @@ func endpoint(t *testing.T, seed int) string {
 	return strings.TrimSpace(string(out))
 }
 
+func TestLatencyProbeEndToEnd(t *testing.T) {
+	for _, mode := range []string{"static", "cloud"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := config{mode: mode}
+			if mode == "static" {
+				cfg.tokenFile = secretFile(t, staticToken)
+			} else {
+				_, srv := cloud(t)
+				cfg.nodeID = "node-1"
+				cfg.managementFile = secretFile(t, "management-secret")
+				cfg.cloudURL = srv.URL
+			}
+			g, public, backend := stack(t, cfg)
+			client := &http.Client{Timeout: 3 * time.Second}
+			for _, path := range []string{"/ping", "/generate_204"} {
+				t.Run(path, func(t *testing.T) {
+					want := http.StatusOK
+					if path == "/generate_204" {
+						want = http.StatusNoContent
+					}
+					for _, origin := range []string{backend, public} {
+						resp, err := client.Get(origin + path)
+						if err != nil {
+							t.Fatal(err)
+						}
+						body, err := io.ReadAll(resp.Body)
+						resp.Body.Close()
+						if err != nil {
+							t.Fatal(err)
+						}
+						if resp.StatusCode != want || len(body) != 0 {
+							t.Fatalf("GET %s%s: status=%d body=%q, want %d and empty body", origin, path, resp.StatusCode, body, want)
+						}
+					}
+				})
+			}
+			g.mu.Lock()
+			defer g.mu.Unlock()
+			if len(g.tunnels) != 0 || len(g.endpoints) != 0 || g.accepted != 0 || g.denied != 0 {
+				t.Fatal("latency probes changed admission state")
+			}
+		})
+	}
+}
+
 func TestStaticRelayEndToEnd(t *testing.T) {
 	g, url, backend := stack(t, config{mode: "static", tokenFile: secretFile(t, staticToken)})
 	connectProbe(t, url, "", 7, "denied")
