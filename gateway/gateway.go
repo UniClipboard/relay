@@ -150,7 +150,7 @@ func (g *gateway) publicHandler() http.Handler {
 			w.WriteHeader(200)
 			return
 		}
-		if r.URL.Path != "/relay" && r.URL.Path != "/" && r.URL.Path != "/generate_204" {
+		if r.URL.Path != "/relay" && r.URL.Path != "/" && r.URL.Path != "/ping" && r.URL.Path != "/generate_204" {
 			http.NotFound(w, r)
 			return
 		}
