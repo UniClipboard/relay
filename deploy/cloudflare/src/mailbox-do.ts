@@ -5,7 +5,6 @@ import { isPubKeyAllowed, parseAllowedPubKeys } from "./auth";
 import {
   base64UrlDecode,
   decodeBitmap,
-  decodeSingleFrame,
   encodeBitmap,
   type Envelope,
   GCM_TAG_SIZE,
@@ -18,9 +17,7 @@ import {
   NONCE_REPLAY_WINDOW_MS,
   normalizeRelayOrigin,
   setBit,
-  sha256,
   SINGLE_CHUNK_THRESHOLD,
-  timingSafeEqualBytes,
   tokenHashHex,
   utf8Bytes,
   validHex64,
@@ -29,6 +26,7 @@ import {
   verifyOwnerAuth,
   VERSION,
 } from "./crypto";
+import { loadS3ConfigFromEnv, S3Client } from "./s3";
 
 const DEFAULT_MAX_TRANSFER_BYTES = 25 * 1024 * 1024;
 const DEFAULT_TTL_SEC = 600;
@@ -37,6 +35,7 @@ const DEFAULT_MAX_SENDERS = 64;
 const DEFAULT_MAX_TRANSFERS = 32;
 const DEFAULT_EVENT_BUFFER = 128;
 const DEFAULT_KEEPALIVE_MS = 25_000;
+const MAX_INLINE_UPLOAD_URLS = 16;
 
 interface SSEEvent {
   id: string;
@@ -52,10 +51,11 @@ type TransferRow = {
   transfer_id: string;
   sender_hash: string;
   envelope_json: string;
-  chunk_hashes_json: string;
+  chunk_sizes_json: string;
   available_b64: string;
   total_chunks: number;
   chunk_size: number;
+  total_ciphertext_bytes: number;
   expires_at_ms: number;
 };
 
@@ -90,14 +90,15 @@ export class MailboxDurableObject extends DurableObject<Env> {
           token_hash TEXT PRIMARY KEY,
           max_bytes INTEGER NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS transfers (
+        CREATE TABLE IF NOT EXISTS transfers_v2 (
           transfer_id TEXT PRIMARY KEY,
           sender_hash TEXT NOT NULL,
           envelope_json TEXT NOT NULL,
-          chunk_hashes_json TEXT NOT NULL,
+          chunk_sizes_json TEXT NOT NULL,
           available_b64 TEXT NOT NULL,
           total_chunks INTEGER NOT NULL,
           chunk_size INTEGER NOT NULL,
+          total_ciphertext_bytes INTEGER NOT NULL,
           expires_at_ms INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS nonces (
@@ -111,6 +112,12 @@ export class MailboxDurableObject extends DurableObject<Env> {
         );
       `);
     });
+  }
+
+  private getS3Client(): S3Client | null {
+    const cfg = loadS3ConfigFromEnv(this.env);
+    if (!cfg) return null;
+    return new S3Client(cfg);
   }
 
   private cfgInt(raw: string | undefined, fallback: number): number {
@@ -145,6 +152,16 @@ export class MailboxDurableObject extends DurableObject<Env> {
     return this.cfgInt(this.env.HYPER_KEEPALIVE_MS, DEFAULT_KEEPALIVE_MS);
   }
 
+  private get presignTtlSec(): number {
+    return this.cfgInt(this.env.S3_PRESIGN_TTL_SEC, 300);
+  }
+
+  private presignTtlFor(nowMs: number, expiresAtMs: number): number {
+    const remainingSec = Math.floor((expiresAtMs - nowMs) / 1000);
+    if (remainingSec <= 0) return 1;
+    return Math.min(remainingSec, this.presignTtlSec);
+  }
+
   private setMailboxId(mailboxId: string): void {
     this.ctx.storage.sql.exec("INSERT OR REPLACE INTO meta (k, v) VALUES ('mailbox_id', ?)", mailboxId);
   }
@@ -154,29 +171,9 @@ export class MailboxDurableObject extends DurableObject<Env> {
     return rows.length > 0 ? rows[0].v : null;
   }
 
-  private r2ChunkKey(mailboxId: string, transferId: string, index: number): string {
-    return `mailboxes/${mailboxId}/transfers/${transferId}/chunks/${index}`;
-  }
-
-  private async deleteR2Transfer(mailboxId: string, transferId: string, totalChunks: number, availableB64: string): Promise<void> {
-    const bm = decodeBitmap(availableB64, totalChunks);
-    const keys: string[] = [];
-    for (let i = 0; i < totalChunks; i++) {
-      if (!bm || hasBit(bm, i)) {
-        keys.push(this.r2ChunkKey(mailboxId, transferId, i));
-      }
-    }
-    for (let offset = 0; offset < keys.length; offset += 1000) {
-      const batch = keys.slice(offset, offset + 1000);
-      if (batch.length > 0) {
-        await this.env.CHUNKS_BUCKET.delete(batch);
-      }
-    }
-  }
-
   private async scheduleNextAlarm(): Promise<void> {
     const tRows = this.ctx.storage.sql
-      .exec<{ m: number | null }>("SELECT MIN(expires_at_ms) AS m FROM transfers")
+      .exec<{ m: number | null }>("SELECT MIN(expires_at_ms) AS m FROM transfers_v2")
       .toArray();
     const nRows = this.ctx.storage.sql
       .exec<{ m: number | null }>("SELECT MIN(expires_at_ms) AS m FROM nonces")
@@ -196,20 +193,19 @@ export class MailboxDurableObject extends DurableObject<Env> {
 
   private async sweepExpired(mailboxId: string | null, nowMs: number): Promise<void> {
     const expiredTransfers = this.ctx.storage.sql
-      .exec<Pick<TransferRow, "transfer_id" | "total_chunks" | "available_b64">>(
-        "SELECT transfer_id, total_chunks, available_b64 FROM transfers WHERE expires_at_ms <= ?",
+      .exec<Pick<TransferRow, "transfer_id" | "total_chunks">>(
+        "SELECT transfer_id, total_chunks FROM transfers_v2 WHERE expires_at_ms <= ?",
         nowMs
       )
       .toArray();
 
     if (expiredTransfers.length > 0) {
-      this.ctx.storage.sql.exec("DELETE FROM transfers WHERE expires_at_ms <= ?", nowMs);
+      this.ctx.storage.sql.exec("DELETE FROM transfers_v2 WHERE expires_at_ms <= ?", nowMs);
       const mbId = mailboxId ?? this.getMailboxId();
-      if (mbId) {
+      const s3 = this.getS3Client();
+      if (mbId && s3) {
         await Promise.all(
-          expiredTransfers.map((tr) =>
-            this.deleteR2Transfer(mbId, tr.transfer_id, tr.total_chunks, tr.available_b64)
-          )
+          expiredTransfers.map((tr) => s3.deleteTransfer(mbId, tr.transfer_id, tr.total_chunks))
         );
       }
     }
@@ -224,11 +220,15 @@ export class MailboxDurableObject extends DurableObject<Env> {
   }
 
   private resolveOrigin(request: Request): string {
-    if (this.env.RELAY_ORIGIN && this.env.RELAY_ORIGIN.trim()) {
-      return normalizeRelayOrigin(this.env.RELAY_ORIGIN) ?? this.env.RELAY_ORIGIN.trim();
+    const configured = (this.env.RELAY_ORIGIN ?? "").trim();
+    if (configured) {
+      return normalizeRelayOrigin(configured) ?? configured;
     }
     const url = new URL(request.url);
-    const proto = request.headers.get("X-Forwarded-Proto")?.toLowerCase() === "https" ? "https" : url.protocol.replace(/:$/, "");
+    const proto =
+      request.headers.get("X-Forwarded-Proto")?.toLowerCase() === "https"
+        ? "https"
+        : url.protocol.replace(/:$/, "");
     return normalizeRelayOrigin(`${proto}://${url.host}`) ?? `${proto}://${url.host}`;
   }
 
@@ -303,11 +303,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
       ...evt,
     };
 
-    // Retain only the newest DEFAULT_EVENT_BUFFER events.
-    this.ctx.storage.sql.exec(
-      "DELETE FROM events WHERE id <= ?",
-      inserted.id - DEFAULT_EVENT_BUFFER
-    );
+    this.ctx.storage.sql.exec("DELETE FROM events WHERE id <= ?", inserted.id - DEFAULT_EVENT_BUFFER);
 
     const frame = utf8Bytes(`id: ${fullEvent.id}\nevent: ${fullEvent.event}\ndata: ${JSON.stringify(fullEvent)}\n\n`);
     for (const sub of this.subscribers) {
@@ -319,18 +315,8 @@ export class MailboxDurableObject extends DurableObject<Env> {
     }
   }
 
-  private validateEnvelope(
-    env: Envelope,
-    expectedTransferId: string,
-    maxBytes: number,
-    nowMs: number
-  ): { hashes: Uint8Array[]; expiresAtMs: number } | Response {
-    if (
-      !env ||
-      env.v !== VERSION ||
-      !validTransferId(env.transfer_id) ||
-      (expectedTransferId && env.transfer_id !== expectedTransferId)
-    ) {
+  private validateEnvelope(env: Envelope, maxBytes: number, nowMs: number): { expiresAtMs: number } | Response {
+    if (!env || env.v !== VERSION || !validTransferId(env.transfer_id)) {
       return jsonErr(400, "invalid_envelope");
     }
     if (
@@ -355,12 +341,10 @@ export class MailboxDurableObject extends DurableObject<Env> {
       }
     }
 
-    const hashes: Uint8Array[] = [];
     for (const hs of env.chunk_hashes) {
       if (typeof hs !== "string") return jsonErr(400, "invalid_chunk_hash");
       const hb = base64UrlDecode(hs);
       if (!hb || hb.length !== 32) return jsonErr(400, "invalid_chunk_hash");
-      hashes.push(hb);
     }
 
     let expiresAtMs = nowMs + this.defaultTtlMs;
@@ -371,7 +355,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
       expiresAtMs = Math.min(env.expires_ms, nowMs + this.maxTtlMs);
     }
 
-    return { hashes, expiresAtMs };
+    return { expiresAtMs };
   }
 
   override async fetch(request: Request): Promise<Response> {
@@ -404,20 +388,28 @@ export class MailboxDurableObject extends DurableObject<Env> {
       return jsonErr(405, "method_not_allowed");
     }
 
-    if (parts.length === 4 && parts[1] === "transfers" && parts[3] === "single") {
-      if (request.method !== "PUT") return jsonErr(405, "method_not_allowed");
+    if (parts.length === 6 && parts[1] === "transfers" && parts[3] === "chunks" && parts[5] === "upload-url") {
+      if (request.method !== "POST") return jsonErr(405, "method_not_allowed");
       if (!validTransferId(parts[2])) return jsonErr(400, "invalid_transfer_id");
-      return this.handleSingleTransfer(request, mailboxId, parts[2]);
+      const idx = parseChunkIndex(parts[4]);
+      if (idx === null) return jsonErr(400, "invalid_chunk_index");
+      return this.handleChunkUploadURL(request, mailboxId, parts[2], idx);
+    }
+
+    if (parts.length === 6 && parts[1] === "transfers" && parts[3] === "chunks" && parts[5] === "commit") {
+      if (request.method !== "POST") return jsonErr(405, "method_not_allowed");
+      if (!validTransferId(parts[2])) return jsonErr(400, "invalid_transfer_id");
+      const idx = parseChunkIndex(parts[4]);
+      if (idx === null) return jsonErr(400, "invalid_chunk_index");
+      return this.handleCommitChunk(request, mailboxId, parts[2], idx);
     }
 
     if (parts.length === 5 && parts[1] === "transfers" && parts[3] === "chunks") {
+      if (request.method !== "GET") return jsonErr(405, "method_not_allowed");
       if (!validTransferId(parts[2])) return jsonErr(400, "invalid_transfer_id");
-      if (!/^\d+$/.test(parts[4])) return jsonErr(400, "invalid_chunk_index");
-      const idx = Number.parseInt(parts[4], 10);
-      if (idx < 0 || idx >= MAX_CHUNKS) return jsonErr(400, "invalid_chunk_index");
-      if (request.method === "PUT") return this.handleUploadChunk(request, mailboxId, parts[2], idx);
-      if (request.method === "GET") return this.handleDownloadChunk(request, mailboxId, parts[2], idx);
-      return jsonErr(405, "method_not_allowed");
+      const idx = parseChunkIndex(parts[4]);
+      if (idx === null) return jsonErr(400, "invalid_chunk_index");
+      return this.handleChunkDownloadURL(request, mailboxId, parts[2], idx);
     }
 
     if (parts.length === 4 && parts[1] === "transfers" && parts[3] === "ack") {
@@ -490,87 +482,14 @@ export class MailboxDurableObject extends DurableObject<Env> {
     return new Response(null, { status: 204 });
   }
 
-  private async handleSingleTransfer(request: Request, mailboxId: string, transferId: string): Promise<Response> {
-    const tok = this.bearerToken(request);
-    if (!tok) return jsonErr(401, "unauthorized");
-    const sender = await this.authorizeSender(tok);
-    if (!sender) return jsonErr(403, "forbidden");
-
-    const maxFrame =
-      Math.min(sender.max_bytes, SINGLE_CHUNK_THRESHOLD + GCM_TAG_SIZE) + MAX_ENVELOPE_JSON_BYTES + 4;
-    const frame = await readLimited(request.body, maxFrame);
-    if (frame === null) return jsonErr(413, "payload_too_large");
-
-    const decoded = decodeSingleFrame(frame);
-    if (!decoded || decoded.envelope.total_chunks !== 1) {
-      return jsonErr(400, "invalid_frame");
-    }
-
-    const nowMs = Date.now();
-    const validated = this.validateEnvelope(decoded.envelope, transferId, sender.max_bytes, nowMs);
-    if (validated instanceof Response) return validated;
-
-    if (decoded.ciphertext.length !== decoded.envelope.total_ciphertext_bytes) {
-      return jsonErr(400, "size_mismatch");
-    }
-    const digest = await sha256(decoded.ciphertext);
-    if (!timingSafeEqualBytes(digest, validated.hashes[0])) {
-      return jsonErr(400, "chunk_hash_mismatch");
-    }
-
-    await this.sweepExpired(mailboxId, nowMs);
-
-    const existing = this.ctx.storage.sql
-      .exec<{ transfer_id: string }>("SELECT transfer_id FROM transfers WHERE transfer_id = ?", transferId)
-      .toArray();
-    if (existing.length > 0) return jsonErr(409, "already_exists");
-
-    const activeCount = this.ctx.storage.sql.exec<{ c: number }>("SELECT COUNT(*) AS c FROM transfers").one().c;
-    if (activeCount >= this.maxTransfers) return jsonErr(429, "mailbox_full");
-
-    await this.env.CHUNKS_BUCKET.put(this.r2ChunkKey(mailboxId, transferId, 0), decoded.ciphertext, {
-      httpMetadata: { contentType: "application/octet-stream" },
-    });
-
-    const bm = newBitmap(1);
-    setBit(bm, 0);
-    const availableB64 = encodeBitmap(bm);
-
-    this.ctx.storage.sql.exec(
-      `INSERT INTO transfers (
-        transfer_id, sender_hash, envelope_json, chunk_hashes_json,
-        available_b64, total_chunks, chunk_size, expires_at_ms
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      transferId,
-      sender.token_hash,
-      JSON.stringify(decoded.envelope),
-      JSON.stringify(decoded.envelope.chunk_hashes),
-      availableB64,
-      1,
-      decoded.envelope.chunk_size,
-      validated.expiresAtMs
-    );
-    await this.scheduleNextAlarm();
-
-    this.publishEvent({
-      event: "transfer_single_ready",
-      transfer_id: transferId,
-      envelope: decoded.envelope,
-      available_bitmap: availableB64,
-      expires_at_ms: validated.expiresAtMs,
-    });
-
-    return Response.json({
-      transfer_id: transferId,
-      expires_at_ms: validated.expiresAtMs,
-    });
-  }
-
   private async handleCreateTransfer(request: Request, mailboxId: string): Promise<Response> {
     const tok = this.bearerToken(request);
     if (!tok) return jsonErr(401, "unauthorized");
     const sender = await this.authorizeSender(tok);
     if (!sender) return jsonErr(403, "forbidden");
+
+    const s3 = this.getS3Client();
+    if (!s3) return jsonErr(503, "s3_not_configured");
 
     const body = await readLimited(request.body, MAX_ENVELOPE_JSON_BYTES);
     if (body === null) return jsonErr(413, "envelope_too_large");
@@ -583,32 +502,42 @@ export class MailboxDurableObject extends DurableObject<Env> {
     }
 
     const nowMs = Date.now();
-    const validated = this.validateEnvelope(env, "", sender.max_bytes, nowMs);
+    const validated = this.validateEnvelope(env, sender.max_bytes, nowMs);
     if (validated instanceof Response) return validated;
 
     await this.sweepExpired(mailboxId, nowMs);
 
     const existing = this.ctx.storage.sql
-      .exec<{ transfer_id: string }>("SELECT transfer_id FROM transfers WHERE transfer_id = ?", env.transfer_id)
+      .exec<{ transfer_id: string }>("SELECT transfer_id FROM transfers_v2 WHERE transfer_id = ?", env.transfer_id)
       .toArray();
     if (existing.length > 0) return jsonErr(409, "already_exists");
 
-    const activeCount = this.ctx.storage.sql.exec<{ c: number }>("SELECT COUNT(*) AS c FROM transfers").one().c;
+    const activeCount = this.ctx.storage.sql.exec<{ c: number }>("SELECT COUNT(*) AS c FROM transfers_v2").one().c;
     if (activeCount >= this.maxTransfers) return jsonErr(429, "mailbox_full");
+
+    const inlineCount = Math.min(env.total_chunks, MAX_INLINE_UPLOAD_URLS);
+    const presignTtl = this.presignTtlFor(nowMs, validated.expiresAtMs);
+    const uploadUrls = await Promise.all(
+      Array.from({ length: inlineCount }, async (_, i) => {
+        const signed = await s3.presignPut(s3.objectKey(mailboxId, env.transfer_id, i), presignTtl, nowMs);
+        return { index: i, ...signed };
+      })
+    );
 
     const availableB64 = encodeBitmap(newBitmap(env.total_chunks));
     this.ctx.storage.sql.exec(
-      `INSERT INTO transfers (
-        transfer_id, sender_hash, envelope_json, chunk_hashes_json,
-        available_b64, total_chunks, chunk_size, expires_at_ms
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO transfers_v2 (
+        transfer_id, sender_hash, envelope_json, chunk_sizes_json,
+        available_b64, total_chunks, chunk_size, total_ciphertext_bytes, expires_at_ms
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       env.transfer_id,
       sender.token_hash,
       JSON.stringify(env),
-      JSON.stringify(env.chunk_hashes),
+      "{}",
       availableB64,
       env.total_chunks,
       env.chunk_size,
+      env.total_ciphertext_bytes,
       validated.expiresAtMs
     );
     await this.scheduleNextAlarm();
@@ -625,10 +554,12 @@ export class MailboxDurableObject extends DurableObject<Env> {
       transfer_id: env.transfer_id,
       expires_at_ms: validated.expiresAtMs,
       max_chunk_bytes: MAX_CHUNK_SIZE + GCM_TAG_SIZE,
+      upload_mode: "presigned",
+      upload_urls: uploadUrls,
     });
   }
 
-  private async handleUploadChunk(
+  private async handleChunkUploadURL(
     request: Request,
     mailboxId: string,
     transferId: string,
@@ -639,51 +570,86 @@ export class MailboxDurableObject extends DurableObject<Env> {
     const sender = await this.authorizeSender(tok);
     if (!sender) return jsonErr(403, "forbidden");
 
+    const s3 = this.getS3Client();
+    if (!s3) return jsonErr(503, "s3_not_configured");
+
     const nowMs = Date.now();
     await this.sweepExpired(mailboxId, nowMs);
 
     const rows = this.ctx.storage.sql
-      .exec<TransferRow>("SELECT * FROM transfers WHERE transfer_id = ?", transferId)
+      .exec<TransferRow>("SELECT * FROM transfers_v2 WHERE transfer_id = ?", transferId)
       .toArray();
     if (rows.length === 0) return jsonErr(404, "not_found");
     const tr = rows[0];
-
     if (tr.sender_hash !== sender.token_hash) return jsonErr(403, "forbidden");
     if (index < 0 || index >= tr.total_chunks) return jsonErr(400, "invalid_chunk_index");
 
-    const hashes = JSON.parse(tr.chunk_hashes_json) as string[];
-    const wantHash = base64UrlDecode(hashes[index]);
-    if (!wantHash || wantHash.length !== 32) return jsonErr(500, "corrupt_metadata");
+    const signed = await s3.presignPut(
+      s3.objectKey(mailboxId, transferId, index),
+      this.presignTtlFor(nowMs, tr.expires_at_ms),
+      nowMs
+    );
+    return Response.json(signed);
+  }
+
+  private async handleCommitChunk(
+    request: Request,
+    mailboxId: string,
+    transferId: string,
+    index: number
+  ): Promise<Response> {
+    const tok = this.bearerToken(request);
+    if (!tok) return jsonErr(401, "unauthorized");
+    const sender = await this.authorizeSender(tok);
+    if (!sender) return jsonErr(403, "forbidden");
+
+    const s3 = this.getS3Client();
+    if (!s3) return jsonErr(503, "s3_not_configured");
+
+    const nowMs = Date.now();
+    await this.sweepExpired(mailboxId, nowMs);
+
+    const rows = this.ctx.storage.sql
+      .exec<TransferRow>("SELECT * FROM transfers_v2 WHERE transfer_id = ?", transferId)
+      .toArray();
+    if (rows.length === 0) return jsonErr(404, "not_found");
+    const tr = rows[0];
+    if (tr.sender_hash !== sender.token_hash) return jsonErr(403, "forbidden");
+    if (index < 0 || index >= tr.total_chunks) return jsonErr(400, "invalid_chunk_index");
+
+    const key = s3.objectKey(mailboxId, transferId, index);
+    let meta;
+    try {
+      meta = await s3.headObject(key, nowMs);
+    } catch {
+      return jsonErr(502, "storage_error");
+    }
+    if (!meta) return jsonErr(404, "chunk_not_uploaded");
 
     const maxChunk = tr.chunk_size + GCM_TAG_SIZE;
-    const body = await readLimited(request.body, maxChunk);
-    if (body === null) return jsonErr(413, "chunk_too_large");
-
-    const digest = await sha256(body);
-    if (!timingSafeEqualBytes(digest, wantHash)) {
-      return jsonErr(400, "chunk_hash_mismatch");
+    if (meta.size <= 0 || meta.size > maxChunk || (tr.total_chunks === 1 && meta.size !== tr.total_ciphertext_bytes)) {
+      await s3.deleteObject(key).catch(() => undefined);
+      return meta.size > maxChunk ? jsonErr(413, "chunk_too_large") : jsonErr(400, "size_mismatch");
     }
 
-    await this.env.CHUNKS_BUCKET.put(this.r2ChunkKey(mailboxId, transferId, index), body, {
-      httpMetadata: { contentType: "application/octet-stream" },
-    });
-
-    // Re-check transfer existence after async R2 write (may have been ACKed or expired).
     const postRows = this.ctx.storage.sql
-      .exec<TransferRow>("SELECT * FROM transfers WHERE transfer_id = ?", transferId)
+      .exec<TransferRow>("SELECT * FROM transfers_v2 WHERE transfer_id = ?", transferId)
       .toArray();
     if (postRows.length === 0) {
-      await this.env.CHUNKS_BUCKET.delete(this.r2ChunkKey(mailboxId, transferId, index));
+      await s3.deleteObject(key).catch(() => undefined);
       return jsonErr(410, "gone");
     }
     const latest = postRows[0];
     const bm = decodeBitmap(latest.available_b64, latest.total_chunks) ?? newBitmap(latest.total_chunks);
     setBit(bm, index);
     const updatedB64 = encodeBitmap(bm);
+    const sizes = JSON.parse(latest.chunk_sizes_json) as Record<string, number>;
+    sizes[String(index)] = meta.size;
 
     this.ctx.storage.sql.exec(
-      "UPDATE transfers SET available_b64 = ? WHERE transfer_id = ?",
+      "UPDATE transfers_v2 SET available_b64 = ?, chunk_sizes_json = ? WHERE transfer_id = ?",
       updatedB64,
+      JSON.stringify(sizes),
       transferId
     );
 
@@ -703,7 +669,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
     if (authErr) return authErr;
 
     await this.sweepExpired(mailboxId, Date.now());
-    const rows = this.ctx.storage.sql.exec<TransferRow>("SELECT * FROM transfers").toArray();
+    const rows = this.ctx.storage.sql.exec<TransferRow>("SELECT * FROM transfers_v2").toArray();
     const transfers = rows.map((tr) => ({
       transfer_id: tr.transfer_id,
       envelope: JSON.parse(tr.envelope_json) as Envelope,
@@ -713,7 +679,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
     return Response.json({ transfers });
   }
 
-  private async handleDownloadChunk(
+  private async handleChunkDownloadURL(
     request: Request,
     mailboxId: string,
     transferId: string,
@@ -722,24 +688,31 @@ export class MailboxDurableObject extends DurableObject<Env> {
     const authErr = await this.verifyOwner(request, mailboxId, new Uint8Array(0));
     if (authErr) return authErr;
 
-    await this.sweepExpired(mailboxId, Date.now());
+    const s3 = this.getS3Client();
+    if (!s3) return jsonErr(503, "s3_not_configured");
+
+    const nowMs = Date.now();
+    await this.sweepExpired(mailboxId, nowMs);
     const rows = this.ctx.storage.sql
-      .exec<TransferRow>("SELECT * FROM transfers WHERE transfer_id = ?", transferId)
+      .exec<TransferRow>("SELECT * FROM transfers_v2 WHERE transfer_id = ?", transferId)
       .toArray();
     if (rows.length === 0) return jsonErr(404, "not_found");
     const tr = rows[0];
     const bm = decodeBitmap(tr.available_b64, tr.total_chunks);
     if (!bm || !hasBit(bm, index)) return jsonErr(404, "not_found");
 
-    const obj = await this.env.CHUNKS_BUCKET.get(this.r2ChunkKey(mailboxId, transferId, index));
-    if (!obj) return jsonErr(404, "not_found");
+    const sizes = JSON.parse(tr.chunk_sizes_json) as Record<string, number>;
+    const signed = await s3.presignGet(
+      s3.objectKey(mailboxId, transferId, index),
+      this.presignTtlFor(nowMs, tr.expires_at_ms),
+      nowMs
+    );
 
-    return new Response(obj.body, {
-      status: 200,
-      headers: {
-        "Content-Type": "application/octet-stream",
-        "Content-Length": String(obj.size),
-      },
+    return Response.json({
+      method: signed.method,
+      url: signed.url,
+      expires_at_ms: signed.expires_at_ms,
+      size: sizes[String(index)] ?? 0,
     });
   }
 
@@ -751,14 +724,14 @@ export class MailboxDurableObject extends DurableObject<Env> {
     if (authErr) return authErr;
 
     const rows = this.ctx.storage.sql
-      .exec<Pick<TransferRow, "total_chunks" | "available_b64">>(
-        "SELECT total_chunks, available_b64 FROM transfers WHERE transfer_id = ?",
-        transferId
-      )
+      .exec<Pick<TransferRow, "total_chunks">>("SELECT total_chunks FROM transfers_v2 WHERE transfer_id = ?", transferId)
       .toArray();
     if (rows.length > 0) {
-      this.ctx.storage.sql.exec("DELETE FROM transfers WHERE transfer_id = ?", transferId);
-      await this.deleteR2Transfer(mailboxId, transferId, rows[0].total_chunks, rows[0].available_b64);
+      this.ctx.storage.sql.exec("DELETE FROM transfers_v2 WHERE transfer_id = ?", transferId);
+      const s3 = this.getS3Client();
+      if (s3) {
+        await s3.deleteTransfer(mailboxId, transferId, rows[0].total_chunks);
+      }
       await this.scheduleNextAlarm();
     }
     return new Response(null, { status: 204 });
@@ -771,15 +744,18 @@ export class MailboxDurableObject extends DurableObject<Env> {
       if (!sender) return jsonErr(403, "forbidden");
 
       const rows = this.ctx.storage.sql
-        .exec<Pick<TransferRow, "sender_hash" | "total_chunks" | "available_b64">>(
-          "SELECT sender_hash, total_chunks, available_b64 FROM transfers WHERE transfer_id = ?",
+        .exec<Pick<TransferRow, "sender_hash" | "total_chunks">>(
+          "SELECT sender_hash, total_chunks FROM transfers_v2 WHERE transfer_id = ?",
           transferId
         )
         .toArray();
       if (rows.length > 0) {
         if (rows[0].sender_hash !== sender.token_hash) return jsonErr(403, "forbidden");
-        this.ctx.storage.sql.exec("DELETE FROM transfers WHERE transfer_id = ?", transferId);
-        await this.deleteR2Transfer(mailboxId, transferId, rows[0].total_chunks, rows[0].available_b64);
+        this.ctx.storage.sql.exec("DELETE FROM transfers_v2 WHERE transfer_id = ?", transferId);
+        const s3 = this.getS3Client();
+        if (s3) {
+          await s3.deleteTransfer(mailboxId, transferId, rows[0].total_chunks);
+        }
         await this.scheduleNextAlarm();
       }
       return new Response(null, { status: 204 });
@@ -789,14 +765,14 @@ export class MailboxDurableObject extends DurableObject<Env> {
     if (authErr) return authErr;
 
     const rows = this.ctx.storage.sql
-      .exec<Pick<TransferRow, "total_chunks" | "available_b64">>(
-        "SELECT total_chunks, available_b64 FROM transfers WHERE transfer_id = ?",
-        transferId
-      )
+      .exec<Pick<TransferRow, "total_chunks">>("SELECT total_chunks FROM transfers_v2 WHERE transfer_id = ?", transferId)
       .toArray();
     if (rows.length > 0) {
-      this.ctx.storage.sql.exec("DELETE FROM transfers WHERE transfer_id = ?", transferId);
-      await this.deleteR2Transfer(mailboxId, transferId, rows[0].total_chunks, rows[0].available_b64);
+      this.ctx.storage.sql.exec("DELETE FROM transfers_v2 WHERE transfer_id = ?", transferId);
+      const s3 = this.getS3Client();
+      if (s3) {
+        await s3.deleteTransfer(mailboxId, transferId, rows[0].total_chunks);
+      }
       await this.scheduleNextAlarm();
     }
     return new Response(null, { status: 204 });
@@ -881,6 +857,13 @@ export class MailboxDurableObject extends DurableObject<Env> {
       },
     });
   }
+}
+
+function parseChunkIndex(raw: string): number | null {
+  if (!/^\d+$/.test(raw)) return null;
+  const idx = Number.parseInt(raw, 10);
+  if (idx < 0 || idx >= MAX_CHUNKS) return null;
+  return idx;
 }
 
 async function readLimited(body: ReadableStream<Uint8Array> | null, limit: number): Promise<Uint8Array | null> {

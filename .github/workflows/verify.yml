@@ -58,7 +58,13 @@ jobs:
         run: docker build -t uniclipboard-hyper-relay:ci .
       - name: Smoke test /healthz
         run: |
-          docker run -d --name hyper-ci -p 127.0.0.1:18080:8080 uniclipboard-hyper-relay:ci
+          docker run -d --name hyper-ci -p 127.0.0.1:18080:8080 \
+            -e S3_ENDPOINT=https://cos.ap-guangzhou.myqcloud.com \
+            -e S3_REGION=ap-guangzhou \
+            -e S3_BUCKET=ci-bucket-1250000000 \
+            -e S3_ACCESS_KEY_ID=ci-ak \
+            -e S3_SECRET_ACCESS_KEY=ci-sk \
+            uniclipboard-hyper-relay:ci
           trap 'docker rm -f hyper-ci' EXIT
           sleep 2
           curl --fail --silent http://127.0.0.1:18080/healthz

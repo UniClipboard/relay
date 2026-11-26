@@ -26,6 +26,7 @@ export default {
           status: "ok",
           service: "hyper-relay",
           runtime: "cloudflare-workers",
+          storage: "s3-direct",
         });
       }
 

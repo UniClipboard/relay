@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// UniClipboard Hyper Relay (Relay HTTP API v1) — Cloudflare Workers + Durable Objects + R2
+// UniClipboard Hyper Relay (Direct-to-S3 Relay HTTP API v2) — Cloudflare Workers + Durable Objects
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "uniclipboard-hyper-relay",
@@ -31,23 +31,22 @@
       "new_sqlite_classes": ["MailboxDurableObject"]
     }
   ],
-  "r2_buckets": [
-    {
-      "binding": "CHUNKS_BUCKET",
-      "bucket_name": "uniclipboard-hyper-chunks"
-    }
-  ],
   // Non-secret runtime defaults.
-  // Optional secrets / overrides:
-  //   - RELAY_ACCESS_KEY (set via `wrangler secret put RELAY_ACCESS_KEY`)
-  //   - RELAY_ORIGIN (set if behind a custom domain or reverse proxy)
-  //   - RELAY_ALLOWED_PUBKEYS (comma-separated base64url Ed25519 device public keys)
+  // Configure S3-compatible object storage (Tencent COS, Cloudflare R2, AWS S3, Aliyun OSS, MinIO):
+  //   - Non-secret vars: S3_ENDPOINT, S3_PUBLIC_ENDPOINT (optional), S3_REGION, S3_BUCKET,
+  //                      S3_FORCE_PATH_STYLE, S3_KEY_PREFIX, S3_PRESIGN_TTL_SEC
+  //   - Secrets (via `wrangler secret put`):
+  //                      S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, RELAY_ACCESS_KEY (optional)
   "vars": {
     "HYPER_MAX_TRANSFER_BYTES": "26214400",
     "HYPER_DEFAULT_TTL_SEC": "600",
     "HYPER_MAX_TTL_SEC": "1800",
     "HYPER_MAX_SENDERS": "64",
     "HYPER_MAX_TRANSFERS": "32",
-    "HYPER_KEEPALIVE_MS": "25000"
+    "HYPER_KEEPALIVE_MS": "25000",
+    "S3_REGION": "auto",
+    "S3_FORCE_PATH_STYLE": "false",
+    "S3_KEY_PREFIX": "mailboxes",
+    "S3_PRESIGN_TTL_SEC": "300"
   }
 }

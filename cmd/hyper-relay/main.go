@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// Command hyper-relay is the standalone, zero-knowledge Relay HTTP API v1
-// microservice for self-hosted and Cloud-managed UniClipboard hybrid sync
-// transfers. It shares its credential abstraction (internal/auth) with the
-// future P2P/DERP relay service while remaining completely decoupled in
-// process and runtime behavior.
+// Command hyper-relay is the standalone, zero-knowledge Hyper Relay control
+// plane microservice. Clients upload and download encrypted chunks directly to
+// S3-compatible object storage (Tencent COS, Cloudflare R2, AWS S3, Aliyun OSS,
+// MinIO) using short-lived SigV4 presigned URLs issued by this service.
 package main
 
 import (
@@ -21,6 +20,7 @@ import (
 
 	"github.com/uniclipboard/relay/internal/auth"
 	"github.com/uniclipboard/relay/internal/hyper"
+	"github.com/uniclipboard/relay/internal/s3store"
 )
 
 func main() {
@@ -40,9 +40,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	objectStore, err := s3store.LoadFromEnv(os.Getenv)
+	if err != nil {
+		logger.Error("failed to initialize S3 object storage", "error", err)
+		os.Exit(1)
+	}
+
 	cfg := hyper.Config{
-		Origin:     firstNonEmpty(os.Getenv("HYPER_ORIGIN"), os.Getenv("UNIC_RELAY_ORIGIN")),
-		Authorizer: authorizer,
+		Origin:      firstNonEmpty(os.Getenv("HYPER_ORIGIN"), os.Getenv("UNIC_RELAY_ORIGIN")),
+		Authorizer:  authorizer,
+		ObjectStore: objectStore,
 	}
 
 	if n, ok := parseEnvInt64("HYPER_MAX_TRANSFER_BYTES", "UNIC_RELAY_MAX_BYTES"); ok && n > 0 {
@@ -60,19 +67,11 @@ func main() {
 	if d, ok := parseEnvDuration("HYPER_MAX_TTL"); ok && d > 0 {
 		cfg.MaxTTL = d
 	}
+	if d, ok := parseEnvDuration("S3_PRESIGN_TTL"); ok && d > 0 {
+		cfg.PresignTTL = d
+	}
 	if d, ok := parseEnvDuration("HYPER_KEEPALIVE_INTERVAL"); ok && d > 0 {
 		cfg.KeepaliveInterval = d
-	}
-
-	storageMode := "memory"
-	if storageDir := strings.TrimSpace(os.Getenv("HYPER_STORAGE_DIR")); storageDir != "" {
-		diskStore, err := hyper.NewDiskChunkStore(storageDir)
-		if err != nil {
-			logger.Error("failed to initialize disk chunk store", "error", err)
-			os.Exit(1)
-		}
-		cfg.Store = diskStore
-		storageMode = "disk"
 	}
 
 	sweepInterval := time.Minute
@@ -80,7 +79,11 @@ func main() {
 		sweepInterval = d
 	}
 
-	srv := hyper.New(cfg)
+	srv, err := hyper.New(cfg)
+	if err != nil {
+		logger.Error("failed to initialize hyper-relay server", "error", err)
+		os.Exit(1)
+	}
 	httpSrv := &http.Server{
 		Addr:              addr,
 		Handler:           srv,
@@ -96,7 +99,9 @@ func main() {
 		for {
 			select {
 			case <-t.C:
-				srv.Sweep()
+				sweepCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				srv.Sweep(sweepCtx)
+				cancel()
 			case <-stopSweep:
 				return
 			}
@@ -123,7 +128,7 @@ func main() {
 	logger.Info(
 		"hyper-relay listening",
 		"addr", addr,
-		"storage_mode", storageMode,
+		"storage_mode", "s3-direct",
 		"has_origin", cfg.Origin != "",
 		"has_access_key", authSummary.HasAccessKey,
 		"allowed_pubkeys", authSummary.AllowedPubKeyCount,

@@ -5,6 +5,7 @@ package hyper
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/ecdh"
 	"crypto/ed25519"
 	"encoding/base64"
@@ -15,13 +16,16 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/uniclipboard/relay/internal/auth"
 	"github.com/uniclipboard/relay/internal/relaycrypto"
+	"github.com/uniclipboard/relay/internal/s3store"
 )
 
 type vecSigner struct {
@@ -109,17 +113,109 @@ func applyOwnerHeaders(t *testing.T, req *http.Request, owner relaycrypto.Signer
 	req.Header.Set("X-Unic-Sig", hdrs.Sig)
 }
 
+type mockS3Harness struct {
+	srv     *httptest.Server
+	store   *s3store.Client
+	mu      sync.Mutex
+	objects map[string][]byte
+}
+
+func newMockS3(t *testing.T) *mockS3Harness {
+	t.Helper()
+	h := &mockS3Harness{objects: map[string][]byte{}}
+	h.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			if r.URL.Query().Get("X-Amz-Signature") == "" {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			body, _ := io.ReadAll(r.Body)
+			h.mu.Lock()
+			h.objects[r.URL.Path] = body
+			h.mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case http.MethodHead:
+			if !strings.HasPrefix(r.Header.Get("Authorization"), "AWS4-HMAC-SHA256 ") {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			h.mu.Lock()
+			b, ok := h.objects[r.URL.Path]
+			h.mu.Unlock()
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(b)))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			if r.URL.Query().Get("X-Amz-Signature") == "" {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			h.mu.Lock()
+			b, ok := h.objects[r.URL.Path]
+			h.mu.Unlock()
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(b)
+		case http.MethodDelete:
+			if !strings.HasPrefix(r.Header.Get("Authorization"), "AWS4-HMAC-SHA256 ") {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			h.mu.Lock()
+			delete(h.objects, r.URL.Path)
+			h.mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	t.Cleanup(h.srv.Close)
+
+	store, err := s3store.New(s3store.Config{
+		Endpoint:        h.srv.URL,
+		Region:          "ap-guangzhou",
+		Bucket:          "unic-test-bucket",
+		AccessKeyID:     "AKTEST",
+		SecretAccessKey: "SKTEST",
+		ForcePathStyle:  true,
+		HTTPClient:      h.srv.Client(),
+	})
+	if err != nil {
+		t.Fatalf("s3store.New: %v", err)
+	}
+	h.store = store
+	return h
+}
+
+func (h *mockS3Harness) count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.objects)
+}
+
 func TestVectorOwnerAuthAndReplayProtection(t *testing.T) {
 	doc := loadVectorDoc(t)
 	now := time.Unix(doc.OwnerAuth.NowUnix, 0)
+	s3 := newMockS3(t)
 
-	srv := New(Config{
-		Origin: doc.RelayOrigin,
-		Now:    func() time.Time { return now },
+	srv, err := New(Config{
+		Origin:      doc.RelayOrigin,
+		ObjectStore: s3.store,
+		Now:         func() time.Time { return now },
 	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
 	defer srv.Close()
 
-	// Exact vector request must pass once.
 	req := httptest.NewRequest(doc.OwnerAuth.Method, doc.OwnerAuth.PathAndQuery, nil)
 	req.Header.Set("X-Unic-PubKey", doc.OwnerAuth.Headers.PubKey)
 	req.Header.Set("X-Unic-Timestamp", doc.OwnerAuth.Headers.Timestamp)
@@ -132,7 +228,6 @@ func TestVectorOwnerAuthAndReplayProtection(t *testing.T) {
 		t.Fatalf("vector owner auth failed: status=%d body=%s", rec.Code, rec.Body.String())
 	}
 
-	// Replaying the exact same nonce within 120s must fail with 401.
 	rec2 := httptest.NewRecorder()
 	srv.ServeHTTP(rec2, req.Clone(req.Context()))
 	if rec2.Code != http.StatusUnauthorized {
@@ -145,6 +240,7 @@ func TestHealthzAndSharedAccessControl(t *testing.T) {
 	recipient := signerFromSeedHex(t, doc.Keys.Recipient.Seed)
 	other := signerFromSeedHex(t, doc.Keys.Sender.Seed)
 	now := time.Unix(doc.OwnerAuth.NowUnix, 0)
+	s3 := newMockS3(t)
 
 	allowedPK := base64.RawURLEncoding.EncodeToString(recipient.Public())
 	authorizer, err := auth.NewStatic(auth.StaticConfig{
@@ -155,21 +251,23 @@ func TestHealthzAndSharedAccessControl(t *testing.T) {
 		t.Fatalf("NewStatic: %v", err)
 	}
 
-	srv := New(Config{
-		Origin:     doc.RelayOrigin,
-		Authorizer: authorizer,
-		Now:        func() time.Time { return now },
+	srv, err := New(Config{
+		Origin:      doc.RelayOrigin,
+		Authorizer:  authorizer,
+		ObjectStore: s3.store,
+		Now:         func() time.Time { return now },
 	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
 	defer srv.Close()
 
-	// /healthz must work without credentials.
 	hRec := httptest.NewRecorder()
 	srv.ServeHTTP(hRec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
-	if hRec.Code != http.StatusOK || !strings.Contains(hRec.Body.String(), `"ok"`) {
+	if hRec.Code != http.StatusOK || !strings.Contains(hRec.Body.String(), `"s3-direct"`) {
 		t.Fatalf("unexpected /healthz response: %d %s", hRec.Code, hRec.Body.String())
 	}
 
-	// API without X-Unic-Relay-Key fails with 401.
 	req := httptest.NewRequest(http.MethodGet, "/v1/relay/mailboxes/"+doc.Keys.Recipient.MailboxID+"/transfers", nil)
 	applyOwnerHeaders(t, req, recipient, doc.RelayOrigin, nil, now, "nonce-access-check-1")
 	rec := httptest.NewRecorder()
@@ -178,7 +276,6 @@ func TestHealthzAndSharedAccessControl(t *testing.T) {
 		t.Fatalf("expected 401 without access key, got %d", rec.Code)
 	}
 
-	// API with valid access key and allowed pubkey succeeds.
 	req.Header.Set(auth.AccessKeyHeader, "shared-secret-key")
 	rec = httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
@@ -186,7 +283,6 @@ func TestHealthzAndSharedAccessControl(t *testing.T) {
 		t.Fatalf("expected 200 with valid access key, got %d body=%s", rec.Code, rec.Body.String())
 	}
 
-	// API with valid access key but disallowed pubkey fails with 403.
 	otherMailbox, _ := relaycrypto.DeriveMailboxID(doc.RelayOrigin, other.Public())
 	otherReq := httptest.NewRequest(http.MethodGet, "/v1/relay/mailboxes/"+otherMailbox+"/transfers", nil)
 	otherReq.Header.Set(auth.AccessKeyHeader, "shared-secret-key")
@@ -198,217 +294,211 @@ func TestHealthzAndSharedAccessControl(t *testing.T) {
 	}
 }
 
-func TestFullTransferLifecycleMemoryAndDisk(t *testing.T) {
-	for _, mode := range []string{"memory", "disk"} {
-		t.Run(mode, func(t *testing.T) {
-			doc := loadVectorDoc(t)
-			recipient := signerFromSeedHex(t, doc.Keys.Recipient.Seed)
-			mailboxID := doc.Keys.Recipient.MailboxID
-			origin := doc.RelayOrigin
-			var nowUnix atomic.Int64
-			nowUnix.Store(doc.Transfer.CreatedMs/1000 + 1)
+func TestDirectS3TransferLifecycleAndTTLSweep(t *testing.T) {
+	doc := loadVectorDoc(t)
+	recipient := signerFromSeedHex(t, doc.Keys.Recipient.Seed)
+	mailboxID := doc.Keys.Recipient.MailboxID
+	origin := doc.RelayOrigin
+	var nowUnix atomic.Int64
+	nowUnix.Store(doc.Transfer.CreatedMs/1000 + 1)
 
-			var store ChunkStore
-			var storageDir string
-			if mode == "disk" {
-				storageDir = t.TempDir()
-				ds, err := NewDiskChunkStore(storageDir)
-				if err != nil {
-					t.Fatalf("NewDiskChunkStore: %v", err)
-				}
-				store = ds
-			} else {
-				store = NewMemoryChunkStore()
-			}
+	s3 := newMockS3(t)
+	srv, err := New(Config{
+		Origin:            origin,
+		ObjectStore:       s3.store,
+		KeepaliveInterval: 50 * time.Millisecond,
+		Now:               func() time.Time { return time.Unix(nowUnix.Load(), 0) },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer srv.Close()
 
-			srv := New(Config{
-				Origin:            origin,
-				Store:             store,
-				KeepaliveInterval: 50 * time.Millisecond,
-				Now:               func() time.Time { return time.Unix(nowUnix.Load(), 0) },
-			})
-			defer srv.Close()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	client := ts.Client()
 
-			ts := httptest.NewServer(srv)
-			defer ts.Close()
+	token, err := relaycrypto.NewDeliveryToken()
+	if err != nil {
+		t.Fatalf("NewDeliveryToken: %v", err)
+	}
+	tokenHash := relaycrypto.TokenHash(token)
 
-			client := ts.Client()
-			token, err := relaycrypto.NewDeliveryToken()
-			if err != nil {
-				t.Fatalf("NewDeliveryToken: %v", err)
-			}
-			tokenHash := relaycrypto.TokenHash(token)
+	// 1. Register sender token hash.
+	putSenderPath := "/v1/relay/mailboxes/" + mailboxID + "/senders/" + tokenHash
+	putBody := []byte(`{"max_bytes":10485760}`)
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+putSenderPath, bytes.NewReader(putBody))
+	applyOwnerHeaders(t, req, recipient, origin, putBody, time.Unix(nowUnix.Load(), 0), "nonce-put-sender")
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("PUT sender failed: err=%v status=%v", err, resp.StatusCode)
+	}
+	_ = resp.Body.Close()
 
-			// 1. Register sender token hash.
-			putSenderPath := "/v1/relay/mailboxes/" + mailboxID + "/senders/" + tokenHash
-			putBody := []byte(`{"max_bytes":10485760}`)
-			req, _ := http.NewRequest(http.MethodPut, ts.URL+putSenderPath, bytes.NewReader(putBody))
-			applyOwnerHeaders(t, req, recipient, origin, putBody, time.Unix(nowUnix.Load(), 0), "nonce-put-sender")
-			resp, err := client.Do(req)
-			if err != nil || resp.StatusCode != http.StatusNoContent {
-				t.Fatalf("PUT sender failed: err=%v status=%v", err, resp.StatusCode)
-			}
-			_ = resp.Body.Close()
+	// 2. Open SSE stream.
+	ssePath := "/v1/relay/mailboxes/" + mailboxID + "/events"
+	sseReq, _ := http.NewRequest(http.MethodGet, ts.URL+ssePath, nil)
+	applyOwnerHeaders(t, sseReq, recipient, origin, nil, time.Unix(nowUnix.Load(), 0), "nonce-sse-1")
+	sseResp, err := client.Do(sseReq)
+	if err != nil || sseResp.StatusCode != http.StatusOK {
+		t.Fatalf("SSE open failed: err=%v status=%v", err, sseResp.StatusCode)
+	}
+	defer sseResp.Body.Close()
+	sseReader := bufio.NewReader(sseResp.Body)
+	if line, _ := sseReader.ReadString('\n'); !strings.HasPrefix(line, ": connected") {
+		t.Fatalf("expected : connected, got %q", line)
+	}
 
-			// 2. Open SSE stream.
-			ssePath := "/v1/relay/mailboxes/" + mailboxID + "/events"
-			sseReq, _ := http.NewRequest(http.MethodGet, ts.URL+ssePath, nil)
-			applyOwnerHeaders(t, sseReq, recipient, origin, nil, time.Unix(nowUnix.Load(), 0), "nonce-sse-1")
-			sseResp, err := client.Do(sseReq)
-			if err != nil || sseResp.StatusCode != http.StatusOK {
-				t.Fatalf("SSE open failed: err=%v status=%v", err, sseResp.StatusCode)
-			}
-			defer sseResp.Body.Close()
-			sseReader := bufio.NewReader(sseResp.Body)
-			line, _ := sseReader.ReadString('\n')
-			if !strings.HasPrefix(line, ": connected") {
-				t.Fatalf("expected : connected, got %q", line)
-			}
+	// 3. Create transfer -> relay returns inline presigned PUT URLs.
+	envJSON, _ := json.Marshal(doc.Transfer.Envelope)
+	createReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/relay/mailboxes/"+mailboxID+"/transfers", bytes.NewReader(envJSON))
+	createReq.Header.Set("Authorization", "Bearer "+token)
+	createResp, err := client.Do(createReq)
+	if err != nil || createResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST transfer failed: err=%v status=%v", err, createResp.StatusCode)
+	}
+	var created struct {
+		TransferID string             `json:"transfer_id"`
+		UploadMode string             `json:"upload_mode"`
+		UploadURLs []ChunkUploadGrant `json:"upload_urls"`
+	}
+	_ = json.NewDecoder(createResp.Body).Decode(&created)
+	_ = createResp.Body.Close()
+	if created.UploadMode != "presigned" || len(created.UploadURLs) != 2 {
+		t.Fatalf("unexpected create response: %+v", created)
+	}
 
-			// 3. Multi-chunk create + upload chunks from deterministic vector.
-			envJSON, _ := json.Marshal(doc.Transfer.Envelope)
-			createReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/relay/mailboxes/"+mailboxID+"/transfers", bytes.NewReader(envJSON))
-			createReq.Header.Set("Authorization", "Bearer "+token)
-			createResp, err := client.Do(createReq)
-			if err != nil || createResp.StatusCode != http.StatusOK {
-				t.Fatalf("POST transfer failed: err=%v status=%v", err, createResp.StatusCode)
+	// 4. Upload chunk 0 directly to mock S3 using inline URL, and chunk 1 using refreshed upload-url endpoint.
+	for i, ctHex := range doc.Transfer.CiphertextsHex {
+		ct, _ := hex.DecodeString(ctHex)
+		uploadURL := created.UploadURLs[i].URL
+		if i == 1 {
+			urlReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/relay/mailboxes/"+mailboxID+"/transfers/"+doc.Transfer.TransferID+"/chunks/1/upload-url", nil)
+			urlReq.Header.Set("Authorization", "Bearer "+token)
+			urlResp, err := client.Do(urlReq)
+			if err != nil || urlResp.StatusCode != http.StatusOK {
+				t.Fatalf("POST upload-url failed: err=%v", err)
 			}
-			_ = createResp.Body.Close()
+			var grant s3store.PresignedURL
+			_ = json.NewDecoder(urlResp.Body).Decode(&grant)
+			_ = urlResp.Body.Close()
+			uploadURL = grant.URL
+		}
 
-			for i, ctHex := range doc.Transfer.CiphertextsHex {
-				ct, _ := hex.DecodeString(ctHex)
-				upReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/relay/mailboxes/"+mailboxID+"/transfers/"+doc.Transfer.TransferID+"/chunks/"+string(rune('0'+i)), bytes.NewReader(ct))
-				upReq.Header.Set("Authorization", "Bearer "+token)
-				upResp, err := client.Do(upReq)
-				if err != nil || upResp.StatusCode != http.StatusNoContent {
-					t.Fatalf("PUT chunk %d failed: err=%v status=%v", i, err, upResp.StatusCode)
-				}
-				_ = upResp.Body.Close()
-			}
+		// Direct PUT to S3 (no relay auth headers!).
+		s3PutReq, _ := http.NewRequest(http.MethodPut, uploadURL, bytes.NewReader(ct))
+		s3PutResp, err := s3.srv.Client().Do(s3PutReq)
+		if err != nil || s3PutResp.StatusCode != http.StatusOK {
+			t.Fatalf("direct S3 PUT chunk %d failed: err=%v status=%v", i, err, s3PutResp)
+		}
+		_ = s3PutResp.Body.Close()
 
-			// Read 3 SSE events (transfer_announced + 2 chunk_ready).
-			var events []SSEEvent
-			for len(events) < 3 {
-				l, err := sseReader.ReadString('\n')
-				if err != nil {
-					t.Fatalf("read SSE: %v", err)
-				}
-				if strings.HasPrefix(l, "data: ") {
-					var ev SSEEvent
-					if err := json.Unmarshal([]byte(strings.TrimPrefix(l, "data: ")), &ev); err != nil {
-						t.Fatalf("unmarshal SSE: %v", err)
-					}
-					events = append(events, ev)
-				}
-			}
-			if events[0].Event != "transfer_announced" || events[1].Event != "chunk_ready" || events[2].Event != "chunk_ready" {
-				t.Fatalf("unexpected SSE event sequence: %+v", events)
-			}
+		// Commit chunk to relay.
+		commitReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/relay/mailboxes/"+mailboxID+"/transfers/"+doc.Transfer.TransferID+"/chunks/"+strconv.Itoa(i)+"/commit", nil)
+		commitReq.Header.Set("Authorization", "Bearer "+token)
+		commitResp, err := client.Do(commitReq)
+		if err != nil || commitResp.StatusCode != http.StatusNoContent {
+			t.Fatalf("POST commit chunk %d failed: err=%v status=%v", i, err, commitResp.StatusCode)
+		}
+		_ = commitResp.Body.Close()
+	}
 
-			// 4. Test Last-Event-ID replay.
-			replayReq, _ := http.NewRequest(http.MethodGet, ts.URL+ssePath, nil)
-			replayReq.Header.Set("Last-Event-ID", events[0].ID)
-			applyOwnerHeaders(t, replayReq, recipient, origin, nil, time.Unix(nowUnix.Load(), 0), "nonce-sse-replay")
-			replayResp, err := client.Do(replayReq)
-			if err != nil || replayResp.StatusCode != http.StatusOK {
-				t.Fatalf("SSE replay failed: err=%v status=%v", err, replayResp.StatusCode)
-			}
-			repReader := bufio.NewReader(replayResp.Body)
-			var replayed []SSEEvent
-			for len(replayed) < 2 {
-				l, err := repReader.ReadString('\n')
-				if err != nil {
-					t.Fatalf("read replay SSE: %v", err)
-				}
-				if strings.HasPrefix(l, "data: ") {
-					var ev SSEEvent
-					_ = json.Unmarshal([]byte(strings.TrimPrefix(l, "data: ")), &ev)
-					replayed = append(replayed, ev)
-				}
-			}
-			_ = replayResp.Body.Close()
-			if replayed[0].ID != events[1].ID || replayed[1].ID != events[2].ID {
-				t.Fatalf("unexpected replayed IDs: %+v", replayed)
-			}
+	if s3.count() != 2 {
+		t.Fatalf("expected 2 objects in S3, got %d", s3.count())
+	}
 
-			// 5. List transfers and download chunks.
-			listReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/relay/mailboxes/"+mailboxID+"/transfers", nil)
-			applyOwnerHeaders(t, listReq, recipient, origin, nil, time.Unix(nowUnix.Load(), 0), "nonce-list")
-			listResp, err := client.Do(listReq)
-			if err != nil || listResp.StatusCode != http.StatusOK {
-				t.Fatalf("GET transfers failed: err=%v", err)
-			}
-			var listed struct {
-				Transfers []TransferSummary `json:"transfers"`
-			}
-			_ = json.NewDecoder(listResp.Body).Decode(&listed)
-			_ = listResp.Body.Close()
-			if len(listed.Transfers) != 1 || listed.Transfers[0].TransferID != doc.Transfer.TransferID {
-				t.Fatalf("unexpected listed transfers: %+v", listed.Transfers)
-			}
+	// Read 3 SSE events (transfer_announced + 2 chunk_ready).
+	var events []SSEEvent
+	for len(events) < 3 {
+		l, err := sseReader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read SSE: %v", err)
+		}
+		if strings.HasPrefix(l, "data: ") {
+			var ev SSEEvent
+			_ = json.Unmarshal([]byte(strings.TrimPrefix(l, "data: ")), &ev)
+			events = append(events, ev)
+		}
+	}
+	if events[0].Event != "transfer_announced" || events[1].Event != "chunk_ready" || events[2].Event != "chunk_ready" {
+		t.Fatalf("unexpected SSE sequence: %+v", events)
+	}
 
-			for i, ctHex := range doc.Transfer.CiphertextsHex {
-				wantCT, _ := hex.DecodeString(ctHex)
-				dlReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/relay/mailboxes/"+mailboxID+"/transfers/"+doc.Transfer.TransferID+"/chunks/"+string(rune('0'+i)), nil)
-				applyOwnerHeaders(t, dlReq, recipient, origin, nil, time.Unix(nowUnix.Load(), 0), "nonce-dl-"+string(rune('0'+i)))
-				dlResp, err := client.Do(dlReq)
-				if err != nil || dlResp.StatusCode != http.StatusOK {
-					t.Fatalf("GET chunk %d failed: err=%v status=%v", i, err, dlResp.StatusCode)
-				}
-				gotCT, _ := io.ReadAll(dlResp.Body)
-				_ = dlResp.Body.Close()
-				if !bytes.Equal(gotCT, wantCT) {
-					t.Fatalf("chunk %d content mismatch", i)
-				}
-			}
+	// 5. Receiver obtains presigned GET URLs and downloads directly from S3.
+	for i, ctHex := range doc.Transfer.CiphertextsHex {
+		wantCT, _ := hex.DecodeString(ctHex)
+		dlReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/relay/mailboxes/"+mailboxID+"/transfers/"+doc.Transfer.TransferID+"/chunks/"+strconv.Itoa(i), nil)
+		applyOwnerHeaders(t, dlReq, recipient, origin, nil, time.Unix(nowUnix.Load(), 0), "nonce-dl-"+strconv.Itoa(i))
+		dlResp, err := client.Do(dlReq)
+		if err != nil || dlResp.StatusCode != http.StatusOK {
+			t.Fatalf("GET chunk download URL %d failed: err=%v status=%v", i, err, dlResp.StatusCode)
+		}
+		var grant struct {
+			Method string `json:"method"`
+			URL    string `json:"url"`
+			Size   int64  `json:"size"`
+		}
+		_ = json.NewDecoder(dlResp.Body).Decode(&grant)
+		_ = dlResp.Body.Close()
+		if grant.Method != http.MethodGet || grant.Size != int64(len(wantCT)) {
+			t.Fatalf("unexpected download grant: %+v", grant)
+		}
 
-			// 6. ACK deletes metadata and chunks immediately (including disk files).
-			ackReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/relay/mailboxes/"+mailboxID+"/transfers/"+doc.Transfer.TransferID+"/ack", nil)
-			applyOwnerHeaders(t, ackReq, recipient, origin, nil, time.Unix(nowUnix.Load(), 0), "nonce-ack")
-			ackResp, err := client.Do(ackReq)
-			if err != nil || ackResp.StatusCode != http.StatusNoContent {
-				t.Fatalf("POST ack failed: err=%v status=%v", err, ackResp.StatusCode)
-			}
-			_ = ackResp.Body.Close()
-			if srv.ActiveTransferCount() != 0 {
-				t.Fatalf("expected 0 active transfers after ack")
-			}
-			if mode == "disk" {
-				transferDir := filepath.Join(storageDir, "chunks", mailboxID, doc.Transfer.TransferID)
-				if _, err := os.Stat(transferDir); !os.IsNotExist(err) {
-					t.Fatalf("expected disk transfer dir to be deleted after ack")
-				}
-			}
+		s3GetResp, err := s3.srv.Client().Get(grant.URL)
+		if err != nil || s3GetResp.StatusCode != http.StatusOK {
+			t.Fatalf("direct S3 GET %d failed: err=%v", i, err)
+		}
+		gotCT, _ := io.ReadAll(s3GetResp.Body)
+		_ = s3GetResp.Body.Close()
+		if !bytes.Equal(gotCT, wantCT) {
+			t.Fatalf("chunk %d content mismatch", i)
+		}
+	}
 
-			// 7. Single-chunk fast path + TTL sweep cleanup.
-			ct0, _ := hex.DecodeString(doc.Transfer.CiphertextsHex[0])
-			singleEnv := doc.Transfer.Envelope
-			singleEnv.TransferID = "fedcba9876543210fedcba9876543210"
-			singleEnv.TotalChunks = 1
-			singleEnv.ChunkSize = len(ct0)
-			singleEnv.TotalCiphertextBytes = int64(len(ct0))
-			singleEnv.ChunkHashes = singleEnv.ChunkHashes[:1]
-			frame, err := relaycrypto.EncodeSingleFrame(singleEnv, ct0)
-			if err != nil {
-				t.Fatalf("EncodeSingleFrame: %v", err)
-			}
-			sReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/relay/mailboxes/"+mailboxID+"/transfers/"+singleEnv.TransferID+"/single", bytes.NewReader(frame))
-			sReq.Header.Set("Authorization", "Bearer "+token)
-			sResp, err := client.Do(sReq)
-			if err != nil || sResp.StatusCode != http.StatusOK {
-				t.Fatalf("PUT single failed: err=%v status=%v", err, sResp.StatusCode)
-			}
-			_ = sResp.Body.Close()
-			if srv.ActiveTransferCount() != 1 {
-				t.Fatalf("expected 1 active transfer after single PUT")
-			}
+	// 6. ACK deletes metadata and purges both S3 objects immediately.
+	ackReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/relay/mailboxes/"+mailboxID+"/transfers/"+doc.Transfer.TransferID+"/ack", nil)
+	applyOwnerHeaders(t, ackReq, recipient, origin, nil, time.Unix(nowUnix.Load(), 0), "nonce-ack")
+	ackResp, err := client.Do(ackReq)
+	if err != nil || ackResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("POST ack failed: err=%v status=%v", err, ackResp.StatusCode)
+	}
+	_ = ackResp.Body.Close()
+	if srv.ActiveTransferCount() != 0 || s3.count() != 0 {
+		t.Fatalf("expected 0 transfers and 0 S3 objects after ACK, got transfers=%d objects=%d", srv.ActiveTransferCount(), s3.count())
+	}
 
-			// Advance clock beyond expires_ms and sweep.
-			nowUnix.Store(doc.Transfer.ExpiresMs/1000 + 5)
-			srv.Sweep()
-			if srv.ActiveTransferCount() != 0 {
-				t.Fatalf("expected 0 active transfers after TTL sweep")
-			}
-		})
+	// 7. Create another transfer, upload to S3, then expire via TTL Sweep and verify S3 cleanup.
+	expEnv := doc.Transfer.Envelope
+	expEnv.TransferID = "fedcba9876543210fedcba9876543210"
+	expEnv.TotalChunks = 1
+	ct0, _ := hex.DecodeString(doc.Transfer.CiphertextsHex[0])
+	expEnv.ChunkSize = len(ct0)
+	expEnv.TotalCiphertextBytes = int64(len(ct0))
+	expEnv.ChunkHashes = expEnv.ChunkHashes[:1]
+	expJSON, _ := json.Marshal(expEnv)
+
+	c2Req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/relay/mailboxes/"+mailboxID+"/transfers", bytes.NewReader(expJSON))
+	c2Req.Header.Set("Authorization", "Bearer "+token)
+	c2Resp, err := client.Do(c2Req)
+	if err != nil || c2Resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST second transfer failed: err=%v", err)
+	}
+	var c2 struct {
+		UploadURLs []ChunkUploadGrant `json:"upload_urls"`
+	}
+	_ = json.NewDecoder(c2Resp.Body).Decode(&c2)
+	_ = c2Resp.Body.Close()
+
+	s3Put, _ := http.NewRequest(http.MethodPut, c2.UploadURLs[0].URL, bytes.NewReader(ct0))
+	rPut, _ := s3.srv.Client().Do(s3Put)
+	_ = rPut.Body.Close()
+	if s3.count() != 1 {
+		t.Fatalf("expected 1 S3 object before sweep")
+	}
+
+	nowUnix.Store(doc.Transfer.ExpiresMs/1000 + 10)
+	srv.Sweep(context.Background())
+	if srv.ActiveTransferCount() != 0 || s3.count() != 0 {
+		t.Fatalf("expected 0 transfers and 0 S3 objects after TTL sweep, got transfers=%d objects=%d", srv.ActiveTransferCount(), s3.count())
 	}
 }

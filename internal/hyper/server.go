@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// Package hyper implements the zero-knowledge Relay HTTP API v1 server
-// (Hybrid Relay Contract §3). It stores only short-TTL ciphertext chunks and
-// opaque mailbox/sender metadata, never plaintext, filenames, or device keys.
+// Package hyper implements the zero-knowledge Relay HTTP API v2 control plane.
+// Clients upload and download AES-256-GCM ciphertext chunks directly against
+// configured S3-compatible object storage (Tencent COS, Cloudflare R2, AWS S3,
+// Aliyun OSS, MinIO) via short-lived SigV4 presigned URLs. The relay server
+// handles only authentication, metadata, SSE notifications, HeadObject commit
+// verification, and immediate DeleteObject cleanup.
 package hyper
 
 import (
-	"crypto/sha256"
-	"crypto/subtle"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -22,6 +24,7 @@ import (
 
 	"github.com/uniclipboard/relay/internal/auth"
 	"github.com/uniclipboard/relay/internal/relaycrypto"
+	"github.com/uniclipboard/relay/internal/s3store"
 )
 
 const (
@@ -29,24 +32,28 @@ const (
 	DefaultMaxSenders       = 64
 	DefaultMaxTransfers     = 32
 	DefaultEventBuffer      = 128
+	DefaultPresignTTL       = 5 * time.Minute
+	MaxInlineUploadURLs     = 16
 	nonceReplayWindow       = 120 * time.Second
 )
 
-// Config configures a Hyper Relay HTTP API v1 server instance.
+// Config configures a Hyper Relay server instance backed by direct S3 storage.
 type Config struct {
 	// Origin is the canonical origin used for Owner Auth and mailbox verification.
 	// If empty, the server derives it from the incoming request.
 	Origin string
 	// Authorizer enforces shared credential policies (access key + Ed25519 allowlist).
-	// If nil, requests are admitted without instance-level access restrictions.
 	Authorizer auth.Authorizer
-	// Store persists encrypted ciphertext chunks (memory by default, or disk temp dir).
-	Store ChunkStore
+	// ObjectStore is the S3-compatible store used to sign presigned URLs, verify
+	// uploaded chunks via HeadObject, and delete expired/ACKed objects. Required.
+	ObjectStore s3store.Store
 	// MaxTransferBytes bounds total ciphertext bytes per transfer (default 25 MiB).
 	MaxTransferBytes int64
 	// DefaultTTL and MaxTTL bound transfer lifetime (default 10m / 30m).
 	DefaultTTL time.Duration
 	MaxTTL     time.Duration
+	// PresignTTL bounds presigned PUT/GET URL lifetime (default 5m).
+	PresignTTL time.Duration
 	// MaxSendersPerMailbox caps registered delivery token hashes per mailbox (default 64).
 	MaxSendersPerMailbox int
 	// MaxTransfersPerMailbox caps concurrent active transfers per mailbox (default 32).
@@ -63,6 +70,15 @@ type TransferSummary struct {
 	Envelope        relaycrypto.Envelope `json:"envelope"`
 	AvailableBitmap string               `json:"available_bitmap"`
 	ExpiresAtMs     int64                `json:"expires_at_ms"`
+}
+
+// ChunkUploadGrant is one presigned PUT grant returned on transfer creation.
+type ChunkUploadGrant struct {
+	Index       int               `json:"index"`
+	Method      string            `json:"method"`
+	URL         string            `json:"url"`
+	Headers     map[string]string `json:"headers,omitempty"`
+	ExpiresAtMs int64             `json:"expires_at_ms"`
 }
 
 // SSEEvent is one server-sent event delivered on GET .../events.
@@ -85,9 +101,15 @@ type storedTransfer struct {
 	id         string
 	senderHash string
 	envelope   relaycrypto.Envelope
-	hashes     [][32]byte
+	chunkSizes map[int]int64
 	available  []byte
 	expiresAt  time.Time
+}
+
+type cleanupTarget struct {
+	mailboxID  string
+	transferID string
+	indices    []int
 }
 
 type sseSubscriber struct {
@@ -103,10 +125,10 @@ type mailboxState struct {
 	subs      map[*sseSubscriber]struct{}
 }
 
-// Server implements the Relay HTTP API v1 microservice handler.
+// Server implements the Direct-to-S3 Hyper Relay HTTP API microservice.
 type Server struct {
 	cfg   Config
-	store ChunkStore
+	store s3store.Store
 
 	mu        sync.Mutex
 	mailboxes map[string]*mailboxState
@@ -116,7 +138,10 @@ type Server struct {
 }
 
 // New creates a new Hyper relay server with validated defaults.
-func New(cfg Config) *Server {
+func New(cfg Config) (*Server, error) {
+	if cfg.ObjectStore == nil {
+		return nil, errors.New("hyper: ObjectStore (S3-compatible storage) is required")
+	}
 	if cfg.MaxTransferBytes <= 0 {
 		cfg.MaxTransferBytes = DefaultMaxTransferBytes
 	}
@@ -128,6 +153,9 @@ func New(cfg Config) *Server {
 	}
 	if cfg.DefaultTTL > cfg.MaxTTL {
 		cfg.DefaultTTL = cfg.MaxTTL
+	}
+	if cfg.PresignTTL <= 0 {
+		cfg.PresignTTL = DefaultPresignTTL
 	}
 	if cfg.MaxSendersPerMailbox <= 0 {
 		cfg.MaxSendersPerMailbox = DefaultMaxSenders
@@ -146,16 +174,12 @@ func New(cfg Config) *Server {
 			cfg.Origin = norm
 		}
 	}
-	store := cfg.Store
-	if store == nil {
-		store = NewMemoryChunkStore()
-	}
 	return &Server{
 		cfg:       cfg,
-		store:     store,
+		store:     cfg.ObjectStore,
 		mailboxes: map[string]*mailboxState{},
 		nonces:    map[string]time.Time{},
-	}
+	}, nil
 }
 
 // RequestCount returns the total number of HTTP requests handled.
@@ -167,7 +191,7 @@ func (s *Server) RequestCount() int64 {
 
 // ActiveTransferCount returns the number of currently stored non-expired transfers.
 func (s *Server) ActiveTransferCount() int {
-	var expired []transferStoreKey
+	var expired []cleanupTarget
 
 	s.mu.Lock()
 	now := s.cfg.Now()
@@ -178,11 +202,11 @@ func (s *Server) ActiveTransferCount() int {
 	}
 	s.mu.Unlock()
 
-	s.deleteChunks(expired)
+	s.deleteObjects(context.Background(), expired)
 	return total
 }
 
-// Close stops active SSE streams and closes the backing ChunkStore.
+// Close stops active SSE streams.
 func (s *Server) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -197,12 +221,12 @@ func (s *Server) Close() error {
 		}
 	}
 	s.mu.Unlock()
-	return s.store.Close()
+	return nil
 }
 
-// Sweep removes expired transfers (and their chunks) as well as expired nonces.
-func (s *Server) Sweep() {
-	var expired []transferStoreKey
+// Sweep removes expired transfers (and deletes their S3 objects) as well as expired nonces.
+func (s *Server) Sweep(ctx context.Context) {
+	var expired []cleanupTarget
 
 	s.mu.Lock()
 	now := s.cfg.Now()
@@ -219,23 +243,35 @@ func (s *Server) Sweep() {
 	}
 	s.mu.Unlock()
 
-	s.deleteChunks(expired)
+	s.deleteObjects(ctx, expired)
 }
 
-func (s *Server) sweepMailboxLocked(mailboxID string, mb *mailboxState, now time.Time) []transferStoreKey {
-	var expired []transferStoreKey
+func transferIndices(tr *storedTransfer) []int {
+	out := make([]int, 0, tr.envelope.TotalChunks)
+	for i := 0; i < tr.envelope.TotalChunks; i++ {
+		out = append(out, i)
+	}
+	return out
+}
+
+func (s *Server) sweepMailboxLocked(mailboxID string, mb *mailboxState, now time.Time) []cleanupTarget {
+	var expired []cleanupTarget
 	for tid, tr := range mb.transfers {
 		if !now.Before(tr.expiresAt) {
 			delete(mb.transfers, tid)
-			expired = append(expired, transferStoreKey{mailboxID: mailboxID, transferID: tid})
+			expired = append(expired, cleanupTarget{
+				mailboxID:  mailboxID,
+				transferID: tid,
+				indices:    transferIndices(tr),
+			})
 		}
 	}
 	return expired
 }
 
-func (s *Server) deleteChunks(keys []transferStoreKey) {
-	for _, k := range keys {
-		_ = s.store.DeleteTransfer(k.mailboxID, k.transferID)
+func (s *Server) deleteObjects(ctx context.Context, targets []cleanupTarget) {
+	for _, t := range targets {
+		_ = s.store.DeleteTransfer(ctx, t.mailboxID, t.transferID, t.indices)
 	}
 }
 
@@ -279,6 +315,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{
 			"status":  "ok",
 			"service": "hyper-relay",
+			"storage": "s3-direct",
 		})
 		return
 	}
@@ -342,8 +379,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		default:
 			writeErr(w, http.StatusMethodNotAllowed, "method_not_allowed")
 		}
-	case len(parts) == 4 && parts[1] == "transfers" && parts[3] == "single":
-		if r.Method != http.MethodPut {
+	case len(parts) == 6 && parts[1] == "transfers" && parts[3] == "chunks" && parts[5] == "upload-url":
+		if r.Method != http.MethodPost {
 			writeErr(w, http.StatusMethodNotAllowed, "method_not_allowed")
 			return
 		}
@@ -351,25 +388,42 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, "invalid_transfer_id")
 			return
 		}
-		s.handleSingleTransfer(w, r, mailboxID, parts[2])
-	case len(parts) == 5 && parts[1] == "transfers" && parts[3] == "chunks":
-		if !relaycrypto.ValidTransferID(parts[2]) {
-			writeErr(w, http.StatusBadRequest, "invalid_transfer_id")
-			return
-		}
-		idx, err := strconv.Atoi(parts[4])
-		if err != nil || idx < 0 || idx >= relaycrypto.MaxChunks {
+		idx, ok := parseChunkIndex(parts[4])
+		if !ok {
 			writeErr(w, http.StatusBadRequest, "invalid_chunk_index")
 			return
 		}
-		switch r.Method {
-		case http.MethodPut:
-			s.handleUploadChunk(w, r, mailboxID, parts[2], idx)
-		case http.MethodGet:
-			s.handleDownloadChunk(w, r, mailboxID, parts[2], idx)
-		default:
+		s.handleChunkUploadURL(w, r, mailboxID, parts[2], idx)
+	case len(parts) == 6 && parts[1] == "transfers" && parts[3] == "chunks" && parts[5] == "commit":
+		if r.Method != http.MethodPost {
 			writeErr(w, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
 		}
+		if !relaycrypto.ValidTransferID(parts[2]) {
+			writeErr(w, http.StatusBadRequest, "invalid_transfer_id")
+			return
+		}
+		idx, ok := parseChunkIndex(parts[4])
+		if !ok {
+			writeErr(w, http.StatusBadRequest, "invalid_chunk_index")
+			return
+		}
+		s.handleCommitChunk(w, r, mailboxID, parts[2], idx)
+	case len(parts) == 5 && parts[1] == "transfers" && parts[3] == "chunks":
+		if r.Method != http.MethodGet {
+			writeErr(w, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
+		if !relaycrypto.ValidTransferID(parts[2]) {
+			writeErr(w, http.StatusBadRequest, "invalid_transfer_id")
+			return
+		}
+		idx, ok := parseChunkIndex(parts[4])
+		if !ok {
+			writeErr(w, http.StatusBadRequest, "invalid_chunk_index")
+			return
+		}
+		s.handleChunkDownloadURL(w, r, mailboxID, parts[2], idx)
 	case len(parts) == 4 && parts[1] == "transfers" && parts[3] == "ack":
 		if r.Method != http.MethodPost {
 			writeErr(w, http.StatusMethodNotAllowed, "method_not_allowed")
@@ -393,6 +447,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeErr(w, http.StatusNotFound, "not_found")
 	}
+}
+
+func parseChunkIndex(raw string) (int, bool) {
+	idx, err := strconv.Atoi(raw)
+	if err != nil || idx < 0 || idx >= relaycrypto.MaxChunks {
+		return 0, false
+	}
+	return idx, true
 }
 
 func ownerTimestampHeader(r *http.Request) string {
@@ -497,6 +559,17 @@ func (s *Server) publishLocked(mb *mailboxState, evt SSEEvent) {
 	}
 }
 
+func (s *Server) presignTTLFor(now, transferExpires time.Time) time.Duration {
+	remaining := transferExpires.Sub(now)
+	if remaining <= 0 {
+		return time.Second
+	}
+	if remaining < s.cfg.PresignTTL {
+		return remaining
+	}
+	return s.cfg.PresignTTL
+}
+
 func (s *Server) handlePutSender(w http.ResponseWriter, r *http.Request, mailboxID, tokenHash string) {
 	if !validHex64(tokenHash) {
 		writeErr(w, http.StatusBadRequest, "invalid_token_hash")
@@ -559,38 +632,36 @@ func (s *Server) handleDeleteSender(w http.ResponseWriter, r *http.Request, mail
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (s *Server) parseEnvelopeForStore(env relaycrypto.Envelope, expectedTransferID string, maxBytes int64, now time.Time) ([][32]byte, time.Time, int, string) {
-	if env.V != relaycrypto.Version || !relaycrypto.ValidTransferID(env.TransferID) || (expectedTransferID != "" && env.TransferID != expectedTransferID) {
-		return nil, time.Time{}, http.StatusBadRequest, "invalid_envelope"
+func (s *Server) validateEnvelope(env relaycrypto.Envelope, maxBytes int64, now time.Time) (time.Time, int, string) {
+	if env.V != relaycrypto.Version || !relaycrypto.ValidTransferID(env.TransferID) {
+		return time.Time{}, http.StatusBadRequest, "invalid_envelope"
 	}
 	if env.TotalChunks <= 0 || env.TotalChunks > relaycrypto.MaxChunks || len(env.ChunkHashes) != env.TotalChunks {
-		return nil, time.Time{}, http.StatusBadRequest, "invalid_chunk_count"
+		return time.Time{}, http.StatusBadRequest, "invalid_chunk_count"
 	}
 	if env.TotalCiphertextBytes <= 0 || env.TotalCiphertextBytes > maxBytes {
-		return nil, time.Time{}, http.StatusRequestEntityTooLarge, "payload_too_large"
+		return time.Time{}, http.StatusRequestEntityTooLarge, "payload_too_large"
 	}
 	if env.TotalChunks == 1 {
 		if env.ChunkSize <= 0 || env.ChunkSize > relaycrypto.SingleChunkThreshold {
-			return nil, time.Time{}, http.StatusBadRequest, "invalid_chunk_size"
+			return time.Time{}, http.StatusBadRequest, "invalid_chunk_size"
 		}
 	} else {
 		if env.ChunkSize < relaycrypto.MinChunkSize || env.ChunkSize > relaycrypto.MaxChunkSize {
-			return nil, time.Time{}, http.StatusBadRequest, "invalid_chunk_size"
+			return time.Time{}, http.StatusBadRequest, "invalid_chunk_size"
 		}
 	}
-	hashes := make([][32]byte, env.TotalChunks)
-	for i, hs := range env.ChunkHashes {
+	for _, hs := range env.ChunkHashes {
 		hb, err := base64.RawURLEncoding.DecodeString(hs)
 		if err != nil || len(hb) != 32 {
-			return nil, time.Time{}, http.StatusBadRequest, "invalid_chunk_hash"
+			return time.Time{}, http.StatusBadRequest, "invalid_chunk_hash"
 		}
-		copy(hashes[i][:], hb)
 	}
 	exp := now.Add(s.cfg.DefaultTTL)
 	if env.ExpiresMs > 0 {
 		envExp := time.UnixMilli(env.ExpiresMs)
 		if !now.Before(envExp) {
-			return nil, time.Time{}, http.StatusBadRequest, "expired"
+			return time.Time{}, http.StatusBadRequest, "expired"
 		}
 		if maxExp := now.Add(s.cfg.MaxTTL); envExp.After(maxExp) {
 			exp = maxExp
@@ -598,130 +669,7 @@ func (s *Server) parseEnvelopeForStore(env relaycrypto.Envelope, expectedTransfe
 			exp = envExp
 		}
 	}
-	return hashes, exp, http.StatusOK, ""
-}
-
-func (s *Server) handleSingleTransfer(w http.ResponseWriter, r *http.Request, mailboxID, transferID string) {
-	tok, ok := bearerToken(r)
-	if !ok {
-		writeErr(w, http.StatusUnauthorized, "unauthorized")
-		return
-	}
-	s.mu.Lock()
-	_, sender, ok := s.authorizeSenderLocked(mailboxID, tok)
-	if !ok {
-		s.mu.Unlock()
-		writeErr(w, http.StatusForbidden, "forbidden")
-		return
-	}
-	maxBytes := sender.maxBytes
-	senderHash := sender.tokenHash
-	s.mu.Unlock()
-
-	maxFrame := min(maxBytes, int64(relaycrypto.SingleChunkThreshold+relaycrypto.GCMTagSize)) + relaycrypto.MaxEnvelopeJSONBytes + 4
-	frame, err := readLimited(r.Body, maxFrame)
-	if err != nil {
-		writeErr(w, http.StatusRequestEntityTooLarge, "payload_too_large")
-		return
-	}
-	env, ct0, err := relaycrypto.DecodeSingleFrame(frame)
-	if err != nil || env.TotalChunks != 1 {
-		writeErr(w, http.StatusBadRequest, "invalid_frame")
-		return
-	}
-	now := s.cfg.Now()
-	hashes, exp, status, reason := s.parseEnvelopeForStore(env, transferID, maxBytes, now)
-	if status != http.StatusOK {
-		writeErr(w, status, reason)
-		return
-	}
-	if int64(len(ct0)) != env.TotalCiphertextBytes {
-		writeErr(w, http.StatusBadRequest, "size_mismatch")
-		return
-	}
-	sum := sha256.Sum256(ct0)
-	if subtle.ConstantTimeCompare(sum[:], hashes[0][:]) != 1 {
-		writeErr(w, http.StatusBadRequest, "chunk_hash_mismatch")
-		return
-	}
-	bm, _ := relaycrypto.NewBitmap(1)
-	relaycrypto.SetBit(bm, 0)
-
-	// Check state before writing chunk to avoid overwriting an existing transfer's chunk.
-	var expired []transferStoreKey
-	s.mu.Lock()
-	mb := s.mailboxes[mailboxID]
-	if mb == nil || mb.senders[senderHash] == nil {
-		s.mu.Unlock()
-		writeErr(w, http.StatusForbidden, "forbidden")
-		return
-	}
-	expired = s.sweepMailboxLocked(mailboxID, mb, now)
-	if _, dup := mb.transfers[transferID]; dup {
-		s.mu.Unlock()
-		s.deleteChunks(expired)
-		writeErr(w, http.StatusConflict, "already_exists")
-		return
-	}
-	if len(mb.transfers) >= s.cfg.MaxTransfersPerMailbox {
-		s.mu.Unlock()
-		s.deleteChunks(expired)
-		writeErr(w, http.StatusTooManyRequests, "mailbox_full")
-		return
-	}
-	s.mu.Unlock()
-	s.deleteChunks(expired)
-
-	if err := s.store.Put(mailboxID, transferID, 0, ct0); err != nil {
-		writeErr(w, http.StatusInternalServerError, "storage_error")
-		return
-	}
-
-	s.mu.Lock()
-	mb = s.mailboxes[mailboxID]
-	if mb == nil || mb.senders[senderHash] == nil {
-		s.mu.Unlock()
-		_ = s.store.DeleteTransfer(mailboxID, transferID)
-		writeErr(w, http.StatusForbidden, "forbidden")
-		return
-	}
-	expired2 := s.sweepMailboxLocked(mailboxID, mb, s.cfg.Now())
-	if _, dup := mb.transfers[transferID]; dup {
-		s.mu.Unlock()
-		s.deleteChunks(expired2)
-		writeErr(w, http.StatusConflict, "already_exists")
-		return
-	}
-	if len(mb.transfers) >= s.cfg.MaxTransfersPerMailbox {
-		s.mu.Unlock()
-		s.deleteChunks(expired2)
-		_ = s.store.DeleteTransfer(mailboxID, transferID)
-		writeErr(w, http.StatusTooManyRequests, "mailbox_full")
-		return
-	}
-	mb.transfers[transferID] = &storedTransfer{
-		id:         transferID,
-		senderHash: senderHash,
-		envelope:   env,
-		hashes:     hashes,
-		available:  bm,
-		expiresAt:  exp,
-	}
-	envCopy := env
-	s.publishLocked(mb, SSEEvent{
-		Event:           "transfer_single_ready",
-		TransferID:      transferID,
-		Envelope:        &envCopy,
-		AvailableBitmap: relaycrypto.EncodeBitmap(bm),
-		ExpiresAtMs:     exp.UnixMilli(),
-	})
-	s.mu.Unlock()
-	s.deleteChunks(expired2)
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"transfer_id":   transferID,
-		"expires_at_ms": exp.UnixMilli(),
-	})
+	return exp, http.StatusOK, ""
 }
 
 func (s *Server) handleCreateTransfer(w http.ResponseWriter, r *http.Request, mailboxID string) {
@@ -752,7 +700,7 @@ func (s *Server) handleCreateTransfer(w http.ResponseWriter, r *http.Request, ma
 		return
 	}
 	now := s.cfg.Now()
-	hashes, exp, status, reason := s.parseEnvelopeForStore(env, "", maxBytes, now)
+	exp, status, reason := s.validateEnvelope(env, maxBytes, now)
 	if status != http.StatusOK {
 		writeErr(w, status, reason)
 		return
@@ -761,6 +709,25 @@ func (s *Server) handleCreateTransfer(w http.ResponseWriter, r *http.Request, ma
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_chunks")
 		return
+	}
+
+	inlineCount := min(env.TotalChunks, MaxInlineUploadURLs)
+	presignTTL := s.presignTTLFor(now, exp)
+	grants := make([]ChunkUploadGrant, 0, inlineCount)
+	for i := 0; i < inlineCount; i++ {
+		key := s.store.ObjectKey(mailboxID, env.TransferID, i)
+		signed, err := s.store.PresignPut(key, presignTTL, now)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "presign_error")
+			return
+		}
+		grants = append(grants, ChunkUploadGrant{
+			Index:       i,
+			Method:      signed.Method,
+			URL:         signed.URL,
+			Headers:     signed.Headers,
+			ExpiresAtMs: signed.ExpiresAtMs,
+		})
 	}
 
 	s.mu.Lock()
@@ -773,13 +740,13 @@ func (s *Server) handleCreateTransfer(w http.ResponseWriter, r *http.Request, ma
 	expired := s.sweepMailboxLocked(mailboxID, mb, now)
 	if _, dup := mb.transfers[env.TransferID]; dup {
 		s.mu.Unlock()
-		s.deleteChunks(expired)
+		s.deleteObjects(r.Context(), expired)
 		writeErr(w, http.StatusConflict, "already_exists")
 		return
 	}
 	if len(mb.transfers) >= s.cfg.MaxTransfersPerMailbox {
 		s.mu.Unlock()
-		s.deleteChunks(expired)
+		s.deleteObjects(r.Context(), expired)
 		writeErr(w, http.StatusTooManyRequests, "mailbox_full")
 		return
 	}
@@ -787,7 +754,7 @@ func (s *Server) handleCreateTransfer(w http.ResponseWriter, r *http.Request, ma
 		id:         env.TransferID,
 		senderHash: senderHash,
 		envelope:   env,
-		hashes:     hashes,
+		chunkSizes: map[int]int64{},
 		available:  bm,
 		expiresAt:  exp,
 	}
@@ -800,16 +767,65 @@ func (s *Server) handleCreateTransfer(w http.ResponseWriter, r *http.Request, ma
 		ExpiresAtMs:     exp.UnixMilli(),
 	})
 	s.mu.Unlock()
-	s.deleteChunks(expired)
+	s.deleteObjects(r.Context(), expired)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"transfer_id":     env.TransferID,
 		"expires_at_ms":   exp.UnixMilli(),
 		"max_chunk_bytes": relaycrypto.MaxChunkSize + relaycrypto.GCMTagSize,
+		"upload_mode":     "presigned",
+		"upload_urls":     grants,
 	})
 }
 
-func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request, mailboxID, transferID string, idx int) {
+func (s *Server) handleChunkUploadURL(w http.ResponseWriter, r *http.Request, mailboxID, transferID string, idx int) {
+	tok, ok := bearerToken(r)
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	now := s.cfg.Now()
+	s.mu.Lock()
+	mb, sender, ok := s.authorizeSenderLocked(mailboxID, tok)
+	if !ok {
+		s.mu.Unlock()
+		writeErr(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	expired := s.sweepMailboxLocked(mailboxID, mb, now)
+	tr := mb.transfers[transferID]
+	if tr == nil {
+		s.mu.Unlock()
+		s.deleteObjects(r.Context(), expired)
+		writeErr(w, http.StatusNotFound, "not_found")
+		return
+	}
+	if tr.senderHash != sender.tokenHash {
+		s.mu.Unlock()
+		s.deleteObjects(r.Context(), expired)
+		writeErr(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	if idx < 0 || idx >= tr.envelope.TotalChunks {
+		s.mu.Unlock()
+		s.deleteObjects(r.Context(), expired)
+		writeErr(w, http.StatusBadRequest, "invalid_chunk_index")
+		return
+	}
+	expiresAt := tr.expiresAt
+	s.mu.Unlock()
+	s.deleteObjects(r.Context(), expired)
+
+	key := s.store.ObjectKey(mailboxID, transferID, idx)
+	signed, err := s.store.PresignPut(key, s.presignTTLFor(now, expiresAt), now)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "presign_error")
+		return
+	}
+	writeJSON(w, http.StatusOK, signed)
+}
+
+func (s *Server) handleCommitChunk(w http.ResponseWriter, r *http.Request, mailboxID, transferID string, idx int) {
 	tok, ok := bearerToken(r)
 	if !ok {
 		writeErr(w, http.StatusUnauthorized, "unauthorized")
@@ -828,40 +844,45 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request, mailb
 	tr := mb.transfers[transferID]
 	if tr == nil {
 		s.mu.Unlock()
-		s.deleteChunks(expired)
+		s.deleteObjects(r.Context(), expired)
 		writeErr(w, http.StatusNotFound, "not_found")
 		return
 	}
 	if tr.senderHash != senderHash {
 		s.mu.Unlock()
-		s.deleteChunks(expired)
+		s.deleteObjects(r.Context(), expired)
 		writeErr(w, http.StatusForbidden, "forbidden")
 		return
 	}
 	if idx < 0 || idx >= tr.envelope.TotalChunks {
 		s.mu.Unlock()
-		s.deleteChunks(expired)
+		s.deleteObjects(r.Context(), expired)
 		writeErr(w, http.StatusBadRequest, "invalid_chunk_index")
 		return
 	}
 	maxChunk := int64(tr.envelope.ChunkSize) + relaycrypto.GCMTagSize
-	wantHash := tr.hashes[idx]
+	totalChunks := tr.envelope.TotalChunks
+	totalCipherBytes := tr.envelope.TotalCiphertextBytes
 	s.mu.Unlock()
-	s.deleteChunks(expired)
+	s.deleteObjects(r.Context(), expired)
 
-	body, err := readLimited(r.Body, maxChunk)
+	key := s.store.ObjectKey(mailboxID, transferID, idx)
+	meta, err := s.store.HeadObject(r.Context(), key)
 	if err != nil {
-		writeErr(w, http.StatusRequestEntityTooLarge, "chunk_too_large")
+		if errors.Is(err, s3store.ErrObjectNotFound) {
+			writeErr(w, http.StatusNotFound, "chunk_not_uploaded")
+			return
+		}
+		writeErr(w, http.StatusBadGateway, "storage_error")
 		return
 	}
-	sum := sha256.Sum256(body)
-	if subtle.ConstantTimeCompare(sum[:], wantHash[:]) != 1 {
-		writeErr(w, http.StatusBadRequest, "chunk_hash_mismatch")
-		return
-	}
-
-	if err := s.store.Put(mailboxID, transferID, idx, body); err != nil {
-		writeErr(w, http.StatusInternalServerError, "storage_error")
+	if meta.Size <= 0 || meta.Size > maxChunk || (totalChunks == 1 && meta.Size != totalCipherBytes) {
+		_ = s.store.DeleteObject(r.Context(), key)
+		if meta.Size > maxChunk {
+			writeErr(w, http.StatusRequestEntityTooLarge, "chunk_too_large")
+		} else {
+			writeErr(w, http.StatusBadRequest, "size_mismatch")
+		}
 		return
 	}
 
@@ -869,7 +890,7 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request, mailb
 	mb = s.mailboxes[mailboxID]
 	if mb == nil || mb.senders[senderHash] == nil {
 		s.mu.Unlock()
-		_ = s.store.DeleteTransfer(mailboxID, transferID)
+		_ = s.store.DeleteObject(r.Context(), key)
 		writeErr(w, http.StatusForbidden, "forbidden")
 		return
 	}
@@ -877,11 +898,12 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request, mailb
 	tr = mb.transfers[transferID]
 	if tr == nil {
 		s.mu.Unlock()
-		s.deleteChunks(expired2)
-		_ = s.store.DeleteTransfer(mailboxID, transferID)
+		s.deleteObjects(r.Context(), expired2)
+		_ = s.store.DeleteObject(r.Context(), key)
 		writeErr(w, http.StatusGone, "gone")
 		return
 	}
+	tr.chunkSizes[idx] = meta.Size
 	relaycrypto.SetBit(tr.available, idx)
 	ci := idx
 	s.publishLocked(mb, SSEEvent{
@@ -892,7 +914,7 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request, mailb
 		ExpiresAtMs:     tr.expiresAt.UnixMilli(),
 	})
 	s.mu.Unlock()
-	s.deleteChunks(expired2)
+	s.deleteObjects(r.Context(), expired2)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -902,7 +924,7 @@ func (s *Server) handleListTransfers(w http.ResponseWriter, r *http.Request, mai
 		return
 	}
 	now := s.cfg.Now()
-	var expired []transferStoreKey
+	var expired []cleanupTarget
 
 	s.mu.Lock()
 	mb := s.mailboxes[mailboxID]
@@ -919,18 +941,18 @@ func (s *Server) handleListTransfers(w http.ResponseWriter, r *http.Request, mai
 		}
 	}
 	s.mu.Unlock()
-	s.deleteChunks(expired)
+	s.deleteObjects(r.Context(), expired)
 
 	writeJSON(w, http.StatusOK, map[string]any{"transfers": out})
 }
 
-func (s *Server) handleDownloadChunk(w http.ResponseWriter, r *http.Request, mailboxID, transferID string, idx int) {
+func (s *Server) handleChunkDownloadURL(w http.ResponseWriter, r *http.Request, mailboxID, transferID string, idx int) {
 	if code, err := s.verifyOwner(r, mailboxID, nil); err != nil {
 		writeErr(w, code, "unauthorized")
 		return
 	}
 	now := s.cfg.Now()
-	var expired []transferStoreKey
+	var expired []cleanupTarget
 
 	s.mu.Lock()
 	mb := s.mailboxes[mailboxID]
@@ -943,27 +965,28 @@ func (s *Server) handleDownloadChunk(w http.ResponseWriter, r *http.Request, mai
 	tr := mb.transfers[transferID]
 	if tr == nil || idx < 0 || idx >= tr.envelope.TotalChunks || !relaycrypto.HasBit(tr.available, idx) {
 		s.mu.Unlock()
-		s.deleteChunks(expired)
+		s.deleteObjects(r.Context(), expired)
 		writeErr(w, http.StatusNotFound, "not_found")
 		return
 	}
+	size := tr.chunkSizes[idx]
+	expiresAt := tr.expiresAt
 	s.mu.Unlock()
-	s.deleteChunks(expired)
+	s.deleteObjects(r.Context(), expired)
 
-	data, err := s.store.Get(mailboxID, transferID, idx)
+	key := s.store.ObjectKey(mailboxID, transferID, idx)
+	signed, err := s.store.PresignGet(key, s.presignTTLFor(now, expiresAt), now)
 	if err != nil {
-		if errors.Is(err, ErrChunkNotFound) {
-			writeErr(w, http.StatusNotFound, "not_found")
-			return
-		}
-		writeErr(w, http.StatusInternalServerError, "storage_error")
+		writeErr(w, http.StatusInternalServerError, "presign_error")
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(data)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"method":        signed.Method,
+		"url":           signed.URL,
+		"expires_at_ms": signed.ExpiresAtMs,
+		"size":          size,
+	})
 }
 
 func (s *Server) handleAckTransfer(w http.ResponseWriter, r *http.Request, mailboxID, transferID string) {
@@ -976,18 +999,28 @@ func (s *Server) handleAckTransfer(w http.ResponseWriter, r *http.Request, mailb
 		writeErr(w, code, "unauthorized")
 		return
 	}
+	var target *cleanupTarget
 	s.mu.Lock()
 	if mb := s.mailboxes[mailboxID]; mb != nil {
-		delete(mb.transfers, transferID)
+		if tr := mb.transfers[transferID]; tr != nil {
+			target = &cleanupTarget{
+				mailboxID:  mailboxID,
+				transferID: transferID,
+				indices:    transferIndices(tr),
+			}
+			delete(mb.transfers, transferID)
+		}
 	}
 	s.mu.Unlock()
-	_ = s.store.DeleteTransfer(mailboxID, transferID)
+	if target != nil {
+		s.deleteObjects(r.Context(), []cleanupTarget{*target})
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleDeleteTransfer(w http.ResponseWriter, r *http.Request, mailboxID, transferID string) {
 	if tok, ok := bearerToken(r); ok {
-		deleted := false
+		var target *cleanupTarget
 		s.mu.Lock()
 		mb, sender, authOK := s.authorizeSenderLocked(mailboxID, tok)
 		if !authOK {
@@ -1001,12 +1034,16 @@ func (s *Server) handleDeleteTransfer(w http.ResponseWriter, r *http.Request, ma
 				writeErr(w, http.StatusForbidden, "forbidden")
 				return
 			}
+			target = &cleanupTarget{
+				mailboxID:  mailboxID,
+				transferID: transferID,
+				indices:    transferIndices(tr),
+			}
 			delete(mb.transfers, transferID)
-			deleted = true
 		}
 		s.mu.Unlock()
-		if deleted {
-			_ = s.store.DeleteTransfer(mailboxID, transferID)
+		if target != nil {
+			s.deleteObjects(r.Context(), []cleanupTarget{*target})
 		}
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -1015,12 +1052,22 @@ func (s *Server) handleDeleteTransfer(w http.ResponseWriter, r *http.Request, ma
 		writeErr(w, code, "unauthorized")
 		return
 	}
+	var target *cleanupTarget
 	s.mu.Lock()
 	if mb := s.mailboxes[mailboxID]; mb != nil {
-		delete(mb.transfers, transferID)
+		if tr := mb.transfers[transferID]; tr != nil {
+			target = &cleanupTarget{
+				mailboxID:  mailboxID,
+				transferID: transferID,
+				indices:    transferIndices(tr),
+			}
+			delete(mb.transfers, transferID)
+		}
 	}
 	s.mu.Unlock()
-	_ = s.store.DeleteTransfer(mailboxID, transferID)
+	if target != nil {
+		s.deleteObjects(r.Context(), []cleanupTarget{*target})
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
