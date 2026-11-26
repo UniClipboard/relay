@@ -1,0 +1,9 @@
+.git
+.github
+.lody
+.env
+secrets
+deploy
+docs
+vectors
+*.md

@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# UniClipboard Relay v2 — Self-Hosted Headless Microservices
+#
+# Services:
+#   - hyper: Zero-knowledge Relay HTTP API v1 microservice (E2EE short-TTL chunk relay).
+#   - p2p:   Reserved slot for future Tailcat DERP relay sharing the same RELAY_* credentials.
+
+services:
+  hyper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/uniclipboard/hyper-relay:latest
+    container_name: uniclipboard-hyper-relay
+    restart: unless-stopped
+    ports:
+      - "${HYPER_PUBLISH_ADDR:-127.0.0.1}:${HYPER_PORT:-8080}:8080"
+    environment:
+      # Shared relay admission credentials (reused by hyper and future p2p services)
+      RELAY_ACCESS_KEY: ${RELAY_ACCESS_KEY:-}
+      RELAY_ALLOWED_PUBKEYS: ${RELAY_ALLOWED_PUBKEYS:-}
+
+      # Hyper relay configuration
+      HYPER_ADDR: ":8080"
+      HYPER_ORIGIN: ${HYPER_ORIGIN:-}
+      HYPER_MAX_TRANSFER_BYTES: ${HYPER_MAX_TRANSFER_BYTES:-26214400}
+      HYPER_DEFAULT_TTL: ${HYPER_DEFAULT_TTL:-10m}
+      HYPER_MAX_TTL: ${HYPER_MAX_TTL:-30m}
+      HYPER_MAX_SENDERS: ${HYPER_MAX_SENDERS:-64}
+      HYPER_MAX_TRANSFERS: ${HYPER_MAX_TRANSFERS:-32}
+      HYPER_KEEPALIVE_INTERVAL: ${HYPER_KEEPALIVE_INTERVAL:-25s}
+      # Set to /var/lib/hyper-relay to spill temporary encrypted chunks to disk
+      # instead of RAM (recommended for low-memory NAS or high concurrency).
+      HYPER_STORAGE_DIR: ${HYPER_STORAGE_DIR:-}
+    volumes:
+      - hyper_data:/var/lib/hyper-relay
+      # Optional: bind-mount an owner-only (chmod 0600, uid 65532) access key file
+      # instead of passing RELAY_ACCESS_KEY via environment variables:
+      # - ./secrets/relay.key:/run/secrets/relay.key:ro
+      # and set RELAY_ACCESS_KEY_FILE=/run/secrets/relay.key
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "/hyper-relay", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # ---------------------------------------------------------------------------
+  # Reserved: P2P Relay (Tailcat DERP) — Out of scope for v2 initial release
+  # ---------------------------------------------------------------------------
+  # When implemented, p2p will share RELAY_ACCESS_KEY / RELAY_ALLOWED_PUBKEYS
+  # and run as an independent headless container via Compose profiles:
+  #
+  # p2p:
+  #   profiles: ["p2p"]
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.p2p
+  #   image: ghcr.io/uniclipboard/p2p-relay:latest
+  #   restart: unless-stopped
+  #   ports:
+  #     - "${P2P_DERP_PORT:-443}:443/tcp"
+  #     - "${P2P_STUN_PORT:-3478}:3478/udp"
+  #   environment:
+  #     RELAY_ACCESS_KEY: ${RELAY_ACCESS_KEY:-}
+  #     RELAY_ALLOWED_PUBKEYS: ${RELAY_ALLOWED_PUBKEYS:-}
+  #     P2P_DERP_ADDR: ":443"
+  #     P2P_STUN_PORT: "3478"
+
+volumes:
+  hyper_data:

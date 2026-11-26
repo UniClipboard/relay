@@ -1,0 +1,22 @@
+# Environment & local secrets (never commit credentials)
+.env
+.env.local
+.dev.vars
+secrets/
+*.key
+*.pem
+
+# Go build & test artifacts
+/bin/
+coverage.out
+
+# Node / Cloudflare Worker artifacts
+deploy/cloudflare/node_modules/
+deploy/cloudflare/.wrangler/
+deploy/cloudflare/dist/
+deploy/cloudflare/worker-configuration.d.ts
+
+# OS & editor files
+.DS_Store
+.idea/
+.vscode/
