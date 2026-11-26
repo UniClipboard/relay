@@ -1,0 +1,65 @@
+name: Verify Relay v2
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go fmt, vet & race tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Unformatted Go files:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: Go vet
+        run: go vet ./...
+      - name: Go test with race detector
+        run: go test -race -v ./...
+
+  cloudflare-worker:
+    name: Cloudflare Worker typecheck & Vitest
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: deploy/cloudflare
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: deploy/cloudflare/package-lock.json
+      - run: npm ci
+      - run: npm run cf-typegen
+      - run: npm run typecheck
+      - run: npm test
+
+  docker:
+    name: Build container & healthcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Hyper relay image
+        run: docker build -t uniclipboard-hyper-relay:ci .
+      - name: Smoke test /healthz
+        run: |
+          docker run -d --name hyper-ci -p 127.0.0.1:18080:8080 uniclipboard-hyper-relay:ci
+          trap 'docker rm -f hyper-ci' EXIT
+          sleep 2
+          curl --fail --silent http://127.0.0.1:18080/healthz
+          docker exec hyper-ci /hyper-relay healthcheck
