@@ -1,9 +1,0 @@
-.git
-.github
-target
-*.token
-*.secret
-.env
-secrets
-artifacts
-.planning
