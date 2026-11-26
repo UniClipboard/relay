@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// UniClipboard Hyper Relay (Relay HTTP API v1) — Cloudflare Workers + Durable Objects + R2
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "uniclipboard-hyper-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-26",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.01
+    }
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "MAILBOX_DO",
+        "class_name": "MailboxDurableObject"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["MailboxDurableObject"]
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "CHUNKS_BUCKET",
+      "bucket_name": "uniclipboard-hyper-chunks"
+    }
+  ],
+  // Non-secret runtime defaults.
+  // Optional secrets / overrides:
+  //   - RELAY_ACCESS_KEY (set via `wrangler secret put RELAY_ACCESS_KEY`)
+  //   - RELAY_ORIGIN (set if behind a custom domain or reverse proxy)
+  //   - RELAY_ALLOWED_PUBKEYS (comma-separated base64url Ed25519 device public keys)
+  "vars": {
+    "HYPER_MAX_TRANSFER_BYTES": "26214400",
+    "HYPER_DEFAULT_TTL_SEC": "600",
+    "HYPER_MAX_TTL_SEC": "1800",
+    "HYPER_MAX_SENDERS": "64",
+    "HYPER_MAX_TRANSFERS": "32",
+    "HYPER_KEEPALIVE_MS": "25000"
+  }
+}
