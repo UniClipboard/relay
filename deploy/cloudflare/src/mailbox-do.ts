@@ -26,7 +26,13 @@ import {
   verifyOwnerAuth,
   VERSION,
 } from "./crypto";
-import { loadS3ConfigFromEnv, S3Client } from "./s3";
+import {
+  loadS3ConfigForProfile,
+  parseStorageProfile,
+  resolveStorageProfile,
+  S3Client,
+  type StorageProfile,
+} from "./s3";
 
 const DEFAULT_MAX_TRANSFER_BYTES = 25 * 1024 * 1024;
 const DEFAULT_TTL_SEC = 600;
@@ -57,6 +63,7 @@ type TransferRow = {
   chunk_size: number;
   total_ciphertext_bytes: number;
   expires_at_ms: number;
+  storage_profile: string;
 };
 
 type SenderRow = {
@@ -81,41 +88,55 @@ export class MailboxDurableObject extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => {
-      this.ctx.storage.sql.exec(`
-        CREATE TABLE IF NOT EXISTS meta (
-          k TEXT PRIMARY KEY,
-          v TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS senders (
-          token_hash TEXT PRIMARY KEY,
-          max_bytes INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS transfers_v2 (
-          transfer_id TEXT PRIMARY KEY,
-          sender_hash TEXT NOT NULL,
-          envelope_json TEXT NOT NULL,
-          chunk_sizes_json TEXT NOT NULL,
-          available_b64 TEXT NOT NULL,
-          total_chunks INTEGER NOT NULL,
-          chunk_size INTEGER NOT NULL,
-          total_ciphertext_bytes INTEGER NOT NULL,
-          expires_at_ms INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS nonces (
-          nonce TEXT PRIMARY KEY,
-          expires_at_ms INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS events (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          event TEXT NOT NULL,
-          payload_json TEXT NOT NULL
-        );
-      `);
+      this.ensureSchema();
     });
   }
 
-  private getS3Client(): S3Client | null {
-    const cfg = loadS3ConfigFromEnv(this.env);
+  private ensureSchema(): void {
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS meta (
+        k TEXT PRIMARY KEY,
+        v TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS senders (
+        token_hash TEXT PRIMARY KEY,
+        max_bytes INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS transfers_v2 (
+        transfer_id TEXT PRIMARY KEY,
+        sender_hash TEXT NOT NULL,
+        envelope_json TEXT NOT NULL,
+        chunk_sizes_json TEXT NOT NULL,
+        available_b64 TEXT NOT NULL,
+        total_chunks INTEGER NOT NULL,
+        chunk_size INTEGER NOT NULL,
+        total_ciphertext_bytes INTEGER NOT NULL,
+        expires_at_ms INTEGER NOT NULL,
+        storage_profile TEXT NOT NULL DEFAULT 'global'
+      );
+      CREATE TABLE IF NOT EXISTS nonces (
+        nonce TEXT PRIMARY KEY,
+        expires_at_ms INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event TEXT NOT NULL,
+        payload_json TEXT NOT NULL
+      );
+    `);
+
+    const cols = this.ctx.storage.sql
+      .exec<{ name: string }>("PRAGMA table_info(transfers_v2)")
+      .toArray();
+    if (!cols.some((c) => c.name === "storage_profile")) {
+      this.ctx.storage.sql.exec(
+        "ALTER TABLE transfers_v2 ADD COLUMN storage_profile TEXT NOT NULL DEFAULT 'global'"
+      );
+    }
+  }
+
+  private getS3ClientForProfile(profile: StorageProfile): S3Client | null {
+    const cfg = loadS3ConfigForProfile(this.env, profile);
     if (!cfg) return null;
     return new S3Client(cfg);
   }
@@ -156,10 +177,10 @@ export class MailboxDurableObject extends DurableObject<Env> {
     return this.cfgInt(this.env.S3_PRESIGN_TTL_SEC, 300);
   }
 
-  private presignTtlFor(nowMs: number, expiresAtMs: number): number {
+  private presignTtlFor(nowMs: number, expiresAtMs: number, maxPresignTtlSec?: number): number {
     const remainingSec = Math.floor((expiresAtMs - nowMs) / 1000);
     if (remainingSec <= 0) return 1;
-    return Math.min(remainingSec, this.presignTtlSec);
+    return Math.min(remainingSec, maxPresignTtlSec ?? this.presignTtlSec);
   }
 
   private setMailboxId(mailboxId: string): void {
@@ -193,8 +214,8 @@ export class MailboxDurableObject extends DurableObject<Env> {
 
   private async sweepExpired(mailboxId: string | null, nowMs: number): Promise<void> {
     const expiredTransfers = this.ctx.storage.sql
-      .exec<Pick<TransferRow, "transfer_id" | "total_chunks">>(
-        "SELECT transfer_id, total_chunks FROM transfers_v2 WHERE expires_at_ms <= ?",
+      .exec<Pick<TransferRow, "transfer_id" | "total_chunks" | "storage_profile">>(
+        "SELECT transfer_id, total_chunks, storage_profile FROM transfers_v2 WHERE expires_at_ms <= ?",
         nowMs
       )
       .toArray();
@@ -202,10 +223,19 @@ export class MailboxDurableObject extends DurableObject<Env> {
     if (expiredTransfers.length > 0) {
       this.ctx.storage.sql.exec("DELETE FROM transfers_v2 WHERE expires_at_ms <= ?", nowMs);
       const mbId = mailboxId ?? this.getMailboxId();
-      const s3 = this.getS3Client();
-      if (mbId && s3) {
+      if (mbId) {
+        const clients = new Map<StorageProfile, S3Client | null>();
         await Promise.all(
-          expiredTransfers.map((tr) => s3.deleteTransfer(mbId, tr.transfer_id, tr.total_chunks))
+          expiredTransfers.map((tr) => {
+            const profile = parseStorageProfile(tr.storage_profile);
+            let s3 = clients.get(profile);
+            if (s3 === undefined) {
+              s3 = this.getS3ClientForProfile(profile);
+              clients.set(profile, s3);
+            }
+            if (!s3) return Promise.resolve();
+            return s3.deleteTransfer(mbId, tr.transfer_id, tr.total_chunks);
+          })
         );
       }
     }
@@ -488,7 +518,9 @@ export class MailboxDurableObject extends DurableObject<Env> {
     const sender = await this.authorizeSender(tok);
     if (!sender) return jsonErr(403, "forbidden");
 
-    const s3 = this.getS3Client();
+    const requestedProfile = parseStorageProfile(request.headers.get("X-Internal-Storage-Profile"));
+    const storageProfile = resolveStorageProfile(this.env, requestedProfile);
+    const s3 = this.getS3ClientForProfile(storageProfile);
     if (!s3) return jsonErr(503, "s3_not_configured");
 
     const body = await readLimited(request.body, MAX_ENVELOPE_JSON_BYTES);
@@ -501,8 +533,17 @@ export class MailboxDurableObject extends DurableObject<Env> {
       return jsonErr(400, "invalid_json");
     }
 
+    let effectiveMaxBytes = Math.min(sender.max_bytes, this.maxTransferBytes);
+    const rawInternalMax = request.headers.get("X-Internal-Max-Transfer-Bytes");
+    if (rawInternalMax) {
+      const keyMax = Number.parseInt(rawInternalMax, 10);
+      if (Number.isFinite(keyMax) && keyMax > 0 && keyMax < effectiveMaxBytes) {
+        effectiveMaxBytes = keyMax;
+      }
+    }
+
     const nowMs = Date.now();
-    const validated = this.validateEnvelope(env, sender.max_bytes, nowMs);
+    const validated = this.validateEnvelope(env, effectiveMaxBytes, nowMs);
     if (validated instanceof Response) return validated;
 
     await this.sweepExpired(mailboxId, nowMs);
@@ -516,7 +557,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
     if (activeCount >= this.maxTransfers) return jsonErr(429, "mailbox_full");
 
     const inlineCount = Math.min(env.total_chunks, MAX_INLINE_UPLOAD_URLS);
-    const presignTtl = this.presignTtlFor(nowMs, validated.expiresAtMs);
+    const presignTtl = this.presignTtlFor(nowMs, validated.expiresAtMs, s3.presignTtlSec);
     const uploadUrls = await Promise.all(
       Array.from({ length: inlineCount }, async (_, i) => {
         const signed = await s3.presignPut(s3.objectKey(mailboxId, env.transfer_id, i), presignTtl, nowMs);
@@ -528,8 +569,8 @@ export class MailboxDurableObject extends DurableObject<Env> {
     this.ctx.storage.sql.exec(
       `INSERT INTO transfers_v2 (
         transfer_id, sender_hash, envelope_json, chunk_sizes_json,
-        available_b64, total_chunks, chunk_size, total_ciphertext_bytes, expires_at_ms
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        available_b64, total_chunks, chunk_size, total_ciphertext_bytes, expires_at_ms, storage_profile
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       env.transfer_id,
       sender.token_hash,
       JSON.stringify(env),
@@ -538,7 +579,8 @@ export class MailboxDurableObject extends DurableObject<Env> {
       env.total_chunks,
       env.chunk_size,
       env.total_ciphertext_bytes,
-      validated.expiresAtMs
+      validated.expiresAtMs,
+      storageProfile
     );
     await this.scheduleNextAlarm();
 
@@ -570,9 +612,6 @@ export class MailboxDurableObject extends DurableObject<Env> {
     const sender = await this.authorizeSender(tok);
     if (!sender) return jsonErr(403, "forbidden");
 
-    const s3 = this.getS3Client();
-    if (!s3) return jsonErr(503, "s3_not_configured");
-
     const nowMs = Date.now();
     await this.sweepExpired(mailboxId, nowMs);
 
@@ -584,9 +623,12 @@ export class MailboxDurableObject extends DurableObject<Env> {
     if (tr.sender_hash !== sender.token_hash) return jsonErr(403, "forbidden");
     if (index < 0 || index >= tr.total_chunks) return jsonErr(400, "invalid_chunk_index");
 
+    const s3 = this.getS3ClientForProfile(parseStorageProfile(tr.storage_profile));
+    if (!s3) return jsonErr(503, "s3_not_configured");
+
     const signed = await s3.presignPut(
       s3.objectKey(mailboxId, transferId, index),
-      this.presignTtlFor(nowMs, tr.expires_at_ms),
+      this.presignTtlFor(nowMs, tr.expires_at_ms, s3.presignTtlSec),
       nowMs
     );
     return Response.json(signed);
@@ -603,9 +645,6 @@ export class MailboxDurableObject extends DurableObject<Env> {
     const sender = await this.authorizeSender(tok);
     if (!sender) return jsonErr(403, "forbidden");
 
-    const s3 = this.getS3Client();
-    if (!s3) return jsonErr(503, "s3_not_configured");
-
     const nowMs = Date.now();
     await this.sweepExpired(mailboxId, nowMs);
 
@@ -616,6 +655,9 @@ export class MailboxDurableObject extends DurableObject<Env> {
     const tr = rows[0];
     if (tr.sender_hash !== sender.token_hash) return jsonErr(403, "forbidden");
     if (index < 0 || index >= tr.total_chunks) return jsonErr(400, "invalid_chunk_index");
+
+    const s3 = this.getS3ClientForProfile(parseStorageProfile(tr.storage_profile));
+    if (!s3) return jsonErr(503, "s3_not_configured");
 
     const key = s3.objectKey(mailboxId, transferId, index);
     let meta;
@@ -688,9 +730,6 @@ export class MailboxDurableObject extends DurableObject<Env> {
     const authErr = await this.verifyOwner(request, mailboxId, new Uint8Array(0));
     if (authErr) return authErr;
 
-    const s3 = this.getS3Client();
-    if (!s3) return jsonErr(503, "s3_not_configured");
-
     const nowMs = Date.now();
     await this.sweepExpired(mailboxId, nowMs);
     const rows = this.ctx.storage.sql
@@ -701,10 +740,13 @@ export class MailboxDurableObject extends DurableObject<Env> {
     const bm = decodeBitmap(tr.available_b64, tr.total_chunks);
     if (!bm || !hasBit(bm, index)) return jsonErr(404, "not_found");
 
+    const s3 = this.getS3ClientForProfile(parseStorageProfile(tr.storage_profile));
+    if (!s3) return jsonErr(503, "s3_not_configured");
+
     const sizes = JSON.parse(tr.chunk_sizes_json) as Record<string, number>;
     const signed = await s3.presignGet(
       s3.objectKey(mailboxId, transferId, index),
-      this.presignTtlFor(nowMs, tr.expires_at_ms),
+      this.presignTtlFor(nowMs, tr.expires_at_ms, s3.presignTtlSec),
       nowMs
     );
 
@@ -724,11 +766,14 @@ export class MailboxDurableObject extends DurableObject<Env> {
     if (authErr) return authErr;
 
     const rows = this.ctx.storage.sql
-      .exec<Pick<TransferRow, "total_chunks">>("SELECT total_chunks FROM transfers_v2 WHERE transfer_id = ?", transferId)
+      .exec<Pick<TransferRow, "total_chunks" | "storage_profile">>(
+        "SELECT total_chunks, storage_profile FROM transfers_v2 WHERE transfer_id = ?",
+        transferId
+      )
       .toArray();
     if (rows.length > 0) {
       this.ctx.storage.sql.exec("DELETE FROM transfers_v2 WHERE transfer_id = ?", transferId);
-      const s3 = this.getS3Client();
+      const s3 = this.getS3ClientForProfile(parseStorageProfile(rows[0].storage_profile));
       if (s3) {
         await s3.deleteTransfer(mailboxId, transferId, rows[0].total_chunks);
       }
@@ -744,15 +789,15 @@ export class MailboxDurableObject extends DurableObject<Env> {
       if (!sender) return jsonErr(403, "forbidden");
 
       const rows = this.ctx.storage.sql
-        .exec<Pick<TransferRow, "sender_hash" | "total_chunks">>(
-          "SELECT sender_hash, total_chunks FROM transfers_v2 WHERE transfer_id = ?",
+        .exec<Pick<TransferRow, "sender_hash" | "total_chunks" | "storage_profile">>(
+          "SELECT sender_hash, total_chunks, storage_profile FROM transfers_v2 WHERE transfer_id = ?",
           transferId
         )
         .toArray();
       if (rows.length > 0) {
         if (rows[0].sender_hash !== sender.token_hash) return jsonErr(403, "forbidden");
         this.ctx.storage.sql.exec("DELETE FROM transfers_v2 WHERE transfer_id = ?", transferId);
-        const s3 = this.getS3Client();
+        const s3 = this.getS3ClientForProfile(parseStorageProfile(rows[0].storage_profile));
         if (s3) {
           await s3.deleteTransfer(mailboxId, transferId, rows[0].total_chunks);
         }
@@ -765,11 +810,14 @@ export class MailboxDurableObject extends DurableObject<Env> {
     if (authErr) return authErr;
 
     const rows = this.ctx.storage.sql
-      .exec<Pick<TransferRow, "total_chunks">>("SELECT total_chunks FROM transfers_v2 WHERE transfer_id = ?", transferId)
+      .exec<Pick<TransferRow, "total_chunks" | "storage_profile">>(
+        "SELECT total_chunks, storage_profile FROM transfers_v2 WHERE transfer_id = ?",
+        transferId
+      )
       .toArray();
     if (rows.length > 0) {
       this.ctx.storage.sql.exec("DELETE FROM transfers_v2 WHERE transfer_id = ?", transferId);
-      const s3 = this.getS3Client();
+      const s3 = this.getS3ClientForProfile(parseStorageProfile(rows[0].storage_profile));
       if (s3) {
         await s3.deleteTransfer(mailboxId, transferId, rows[0].total_chunks);
       }

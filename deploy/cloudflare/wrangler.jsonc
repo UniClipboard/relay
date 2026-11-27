@@ -31,10 +31,12 @@
       "new_sqlite_classes": ["MailboxDurableObject"]
     }
   ],
-  // Non-secret runtime defaults.
+  // Non-secret runtime defaults for self-hosters / Deploy to Cloudflare button.
   // Configure S3-compatible object storage (Tencent COS, Cloudflare R2, AWS S3, Aliyun OSS, MinIO):
   //   - Non-secret vars: S3_ENDPOINT, S3_PUBLIC_ENDPOINT (optional), S3_REGION, S3_BUCKET,
   //                      S3_FORCE_PATH_STYLE, S3_KEY_PREFIX, S3_PRESIGN_TTL_SEC
+  //   - Optional China profile vars: S3_CN_ENDPOINT, S3_CN_PUBLIC_ENDPOINT, S3_CN_REGION,
+  //                      S3_CN_BUCKET, S3_CN_FORCE_PATH_STYLE, S3_CN_KEY_PREFIX, S3_CN_PRESIGN_TTL_SEC
   //   - Secrets (via `wrangler secret put`):
   //                      S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, RELAY_ACCESS_KEY (optional)
   "vars": {
@@ -48,5 +50,62 @@
     "S3_FORCE_PATH_STYLE": "false",
     "S3_KEY_PREFIX": "mailboxes",
     "S3_PRESIGN_TTL_SEC": "300"
+  },
+  "env": {
+    "production": {
+      "name": "uniclipboard-hyper-relay",
+      "routes": [
+        {
+          "pattern": "relay.uniclipboard.app",
+          "custom_domain": true
+        }
+      ],
+      "observability": {
+        "enabled": true,
+        "logs": {
+          "enabled": true,
+          "head_sampling_rate": 1
+        },
+        "traces": {
+          "enabled": true,
+          "head_sampling_rate": 0.01
+        }
+      },
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "MAILBOX_DO",
+            "class_name": "MailboxDurableObject"
+          }
+        ]
+      },
+      "ratelimits": [
+        {
+          "name": "RATE_LIMITER",
+          "namespace_id": "1001",
+          "simple": {
+            "limit": 180,
+            "period": 60
+          }
+        }
+      ],
+      "vars": {
+        "RELAY_ORIGIN": "https://relay.uniclipboard.app",
+        "CLOUD_VERIFY_URL": "https://cloud.uniclipboard.app/api/relay/v2/keys/verify",
+        "CLOUD_VERIFY_CACHE_TTL_SEC": "60",
+        "S3_ENDPOINT": "https://10bd9b12698da3c8aa30ff9ebfa81c71.r2.cloudflarestorage.com",
+        "S3_REGION": "auto",
+        "S3_BUCKET": "uniclipboard-hyper-chunks",
+        "S3_FORCE_PATH_STYLE": "true",
+        "S3_KEY_PREFIX": "mailboxes",
+        "S3_PRESIGN_TTL_SEC": "300",
+        "HYPER_MAX_TRANSFER_BYTES": "26214400",
+        "HYPER_DEFAULT_TTL_SEC": "600",
+        "HYPER_MAX_TTL_SEC": "1800",
+        "HYPER_MAX_SENDERS": "64",
+        "HYPER_MAX_TRANSFERS": "32",
+        "HYPER_KEEPALIVE_MS": "25000"
+      }
+    }
   }
 }

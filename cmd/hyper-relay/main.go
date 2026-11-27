@@ -34,7 +34,7 @@ func main() {
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
-	authorizer, err := auth.LoadStaticFromEnv(os.Getenv)
+	authorizer, authSummary, err := auth.LoadFromEnv(os.Getenv)
 	if err != nil {
 		logger.Error("failed to load shared relay credentials", "error", err)
 		os.Exit(1)
@@ -124,13 +124,13 @@ func main() {
 		_ = srv.Close()
 	}()
 
-	authSummary := authorizer.Summary()
 	logger.Info(
 		"hyper-relay listening",
 		"addr", addr,
 		"storage_mode", "s3-direct",
 		"has_origin", cfg.Origin != "",
 		"has_access_key", authSummary.HasAccessKey,
+		"has_cloud_verify", authSummary.HasCloudVerify,
 		"allowed_pubkeys", authSummary.AllowedPubKeyCount,
 	)
 

@@ -55,6 +55,8 @@ type Decision struct {
 	Allowed       bool
 	StatusCode    int
 	Reason        string
+	Subject       string
+	KeyID         string
 	MaxBytesLimit int64
 }
 
@@ -70,6 +72,7 @@ type Authorizer interface {
 type ConfigSummary struct {
 	HasAccessKey       bool
 	AllowedPubKeyCount int
+	HasCloudVerify     bool
 }
 
 // StaticConfig configures a StaticAuthorizer for self-hosted deployments.

@@ -13,6 +13,8 @@ const UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD";
 const DEFAULT_PRESIGN_TTL_SEC = 300;
 const MAX_PRESIGN_TTL_SEC = 1800;
 
+export type StorageProfile = "global" | "cn";
+
 export interface S3Config {
   endpoint: string;
   publicEndpoint?: string;
@@ -45,19 +47,30 @@ export class S3Error extends Error {
   }
 }
 
-export function loadS3ConfigFromEnv(env: Env): S3Config | null {
-  const endpoint = (env.S3_ENDPOINT ?? "").trim();
-  const bucket = (env.S3_BUCKET ?? "").trim();
-  const accessKeyId = (env.S3_ACCESS_KEY_ID ?? "").trim();
-  const secretAccessKey = (env.S3_SECRET_ACCESS_KEY ?? "").trim();
+export function parseStorageProfile(raw: string | null | undefined): StorageProfile {
+  return raw?.trim().toLowerCase() === "cn" ? "cn" : "global";
+}
+
+function loadExactS3ProfileConfig(env: Env, profile: StorageProfile): S3Config | null {
+  const isCn = profile === "cn";
+  const endpoint = ((isCn ? env.S3_CN_ENDPOINT : env.S3_ENDPOINT) ?? "").trim();
+  const bucket = ((isCn ? env.S3_CN_BUCKET : env.S3_BUCKET) ?? "").trim();
+  const accessKeyId = ((isCn ? env.S3_CN_ACCESS_KEY_ID : env.S3_ACCESS_KEY_ID) ?? "").trim();
+  const secretAccessKey = ((isCn ? env.S3_CN_SECRET_ACCESS_KEY : env.S3_SECRET_ACCESS_KEY) ?? "").trim();
   if (!endpoint || !bucket || !accessKeyId || !secretAccessKey) {
     return null;
   }
-  const region = (env.S3_REGION ?? "").trim() || "auto";
-  const publicEndpoint = (env.S3_PUBLIC_ENDPOINT ?? "").trim() || undefined;
-  const forcePathStyle = parseBool(env.S3_FORCE_PATH_STYLE);
-  const keyPrefix = (env.S3_KEY_PREFIX ?? "").trim().replace(/^\/+|\/+$/g, "") || "mailboxes";
-  const rawTtl = Number.parseInt((env.S3_PRESIGN_TTL_SEC ?? "").trim(), 10);
+  const region = ((isCn ? env.S3_CN_REGION : env.S3_REGION) ?? "").trim() || "auto";
+  const publicEndpoint = ((isCn ? env.S3_CN_PUBLIC_ENDPOINT : env.S3_PUBLIC_ENDPOINT) ?? "").trim() || undefined;
+  const forcePathStyle = parseBool(isCn ? env.S3_CN_FORCE_PATH_STYLE : env.S3_FORCE_PATH_STYLE);
+  const keyPrefix =
+    ((isCn ? env.S3_CN_KEY_PREFIX ?? env.S3_KEY_PREFIX : env.S3_KEY_PREFIX) ?? "")
+      .trim()
+      .replace(/^\/+|\/+$/g, "") || "mailboxes";
+  const rawTtl = Number.parseInt(
+    ((isCn ? env.S3_CN_PRESIGN_TTL_SEC ?? env.S3_PRESIGN_TTL_SEC : env.S3_PRESIGN_TTL_SEC) ?? "").trim(),
+    10
+  );
   const presignTtlSec =
     Number.isFinite(rawTtl) && rawTtl > 0
       ? Math.min(rawTtl, MAX_PRESIGN_TTL_SEC)
@@ -76,6 +89,35 @@ export function loadS3ConfigFromEnv(env: Env): S3Config | null {
   };
 }
 
+export function hasS3Profile(env: Env, profile: StorageProfile): boolean {
+  return loadExactS3ProfileConfig(env, profile) !== null;
+}
+
+export function configuredStorageProfiles(env: Env): StorageProfile[] {
+  const profiles: StorageProfile[] = [];
+  if (hasS3Profile(env, "global")) profiles.push("global");
+  if (hasS3Profile(env, "cn")) profiles.push("cn");
+  return profiles;
+}
+
+export function resolveStorageProfile(env: Env, preferred: StorageProfile): StorageProfile {
+  if (hasS3Profile(env, preferred)) return preferred;
+  const fallback: StorageProfile = preferred === "cn" ? "global" : "cn";
+  if (hasS3Profile(env, fallback)) return fallback;
+  return preferred;
+}
+
+export function loadS3ConfigForProfile(env: Env, profile: StorageProfile = "global"): S3Config | null {
+  const exact = loadExactS3ProfileConfig(env, profile);
+  if (exact) return exact;
+  const fallback: StorageProfile = profile === "cn" ? "global" : "cn";
+  return loadExactS3ProfileConfig(env, fallback);
+}
+
+export function loadS3ConfigFromEnv(env: Env): S3Config | null {
+  return loadS3ConfigForProfile(env, "global");
+}
+
 export class S3Client {
   private readonly endpointUrl: URL;
   private readonly publicEndpointUrl: URL;
@@ -83,6 +125,10 @@ export class S3Client {
   constructor(private readonly cfg: S3Config) {
     this.endpointUrl = parseEndpointUrl(cfg.endpoint);
     this.publicEndpointUrl = cfg.publicEndpoint ? parseEndpointUrl(cfg.publicEndpoint) : this.endpointUrl;
+  }
+
+  get presignTtlSec(): number {
+    return this.cfg.presignTtlSec;
   }
 
   objectKey(mailboxId: string, transferId: string, index: number): string {

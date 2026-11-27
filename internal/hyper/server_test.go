@@ -502,3 +502,98 @@ func TestDirectS3TransferLifecycleAndTTLSweep(t *testing.T) {
 		t.Fatalf("expected 0 transfers and 0 S3 objects after TTL sweep, got transfers=%d objects=%d", srv.ActiveTransferCount(), s3.count())
 	}
 }
+
+func TestCloudAuthorizerEnforcesKeyCapAndFailClosed(t *testing.T) {
+	doc := loadVectorDoc(t)
+	recipient := signerFromSeedHex(t, doc.Keys.Recipient.Seed)
+	mailboxID := doc.Keys.Recipient.MailboxID
+	origin := doc.RelayOrigin
+	now := time.Unix(doc.Transfer.CreatedMs/1000+1, 0)
+	s3 := newMockS3(t)
+
+	var failCloud atomic.Bool
+	cloudSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if failCloud.Load() {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		var body struct {
+			KeyHash string `json:"key_hash"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		// Allow any presented key hash with a strict 10-byte cap (smaller than vector envelope ciphertext).
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"allowed":            true,
+			"subject":            "cloud-user-1",
+			"key_id":             "cloud-key-1",
+			"max_transfer_bytes": 10,
+		})
+	}))
+	defer cloudSrv.Close()
+
+	cloudAuth, err := auth.NewCloud(auth.CloudConfig{
+		VerifyURL:    cloudSrv.URL,
+		VerifySecret: "verify-secret",
+		HTTPClient:   cloudSrv.Client(),
+	})
+	if err != nil {
+		t.Fatalf("NewCloud: %v", err)
+	}
+
+	srv, err := New(Config{
+		Origin:      origin,
+		Authorizer:  cloudAuth,
+		ObjectStore: s3.store,
+		Now:         func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer srv.Close()
+
+	token, _ := relaycrypto.NewDeliveryToken()
+	tokenHash := relaycrypto.TokenHash(token)
+	putPath := "/v1/relay/mailboxes/" + mailboxID + "/senders/" + tokenHash
+	putBody := []byte(`{"max_bytes":10485760}`)
+
+	// Missing X-Unic-Relay-Key -> 401.
+	unauthReq := httptest.NewRequest(http.MethodPut, putPath, bytes.NewReader(putBody))
+	applyOwnerHeaders(t, unauthReq, recipient, origin, putBody, now, "nonce-cloud-1")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, unauthReq)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without relay key, got %d", rec.Code)
+	}
+
+	// Register sender with valid Cloud key.
+	putReq := httptest.NewRequest(http.MethodPut, putPath, bytes.NewReader(putBody))
+	putReq.Header.Set(auth.AccessKeyHeader, "uc_live_capped_key")
+	applyOwnerHeaders(t, putReq, recipient, origin, putBody, now, "nonce-cloud-2")
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, putReq)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 registering sender, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Transfer exceeding Cloud key's max_transfer_bytes (10) must be rejected with 413.
+	envJSON, _ := json.Marshal(doc.Transfer.Envelope)
+	createReq := httptest.NewRequest(http.MethodPost, "/v1/relay/mailboxes/"+mailboxID+"/transfers", bytes.NewReader(envJSON))
+	createReq.Header.Set(auth.AccessKeyHeader, "uc_live_capped_key")
+	createReq.Header.Set("Authorization", "Bearer "+token)
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, createReq)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 enforcing cloud max_transfer_bytes, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Cloud outage on uncached key fails closed with 503 auth_unavailable.
+	failCloud.Store(true)
+	outageReq := httptest.NewRequest(http.MethodGet, "/v1/relay/mailboxes/"+mailboxID+"/transfers", nil)
+	outageReq.Header.Set(auth.AccessKeyHeader, "uc_live_other_key_outage")
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, outageReq)
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "auth_unavailable") {
+		t.Fatalf("expected 503 auth_unavailable on cloud outage, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
