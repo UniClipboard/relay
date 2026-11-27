@@ -320,6 +320,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var authMaxBytes int64
 	if s.cfg.Authorizer != nil {
 		dec := s.cfg.Authorizer.AuthorizeAccessKey(r.Context(), auth.Request{
 			Service:   auth.ServiceHyper,
@@ -337,6 +338,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			writeErr(w, code, reason)
 			return
+		}
+		if dec.MaxBytesLimit > 0 {
+			authMaxBytes = dec.MaxBytesLimit
 		}
 	}
 
@@ -375,7 +379,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case http.MethodGet:
 			s.handleListTransfers(w, r, mailboxID)
 		case http.MethodPost:
-			s.handleCreateTransfer(w, r, mailboxID)
+			s.handleCreateTransfer(w, r, mailboxID, authMaxBytes)
 		default:
 			writeErr(w, http.StatusMethodNotAllowed, "method_not_allowed")
 		}
@@ -672,7 +676,7 @@ func (s *Server) validateEnvelope(env relaycrypto.Envelope, maxBytes int64, now 
 	return exp, http.StatusOK, ""
 }
 
-func (s *Server) handleCreateTransfer(w http.ResponseWriter, r *http.Request, mailboxID string) {
+func (s *Server) handleCreateTransfer(w http.ResponseWriter, r *http.Request, mailboxID string, authMaxBytes int64) {
 	tok, ok := bearerToken(r)
 	if !ok {
 		writeErr(w, http.StatusUnauthorized, "unauthorized")
@@ -686,6 +690,12 @@ func (s *Server) handleCreateTransfer(w http.ResponseWriter, r *http.Request, ma
 		return
 	}
 	maxBytes := sender.maxBytes
+	if maxBytes <= 0 || maxBytes > s.cfg.MaxTransferBytes {
+		maxBytes = s.cfg.MaxTransferBytes
+	}
+	if authMaxBytes > 0 && authMaxBytes < maxBytes {
+		maxBytes = authMaxBytes
+	}
 	senderHash := sender.tokenHash
 	s.mu.Unlock()
 

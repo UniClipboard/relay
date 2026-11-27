@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { ACCESS_KEY_HEADER, type AuthEnv, verifyAccessKey } from "./auth";
+import { ACCESS_KEY_HEADER, type AuthEnv, verifyCloudAccessKey } from "./auth";
 import { validMailboxId } from "./crypto";
+import { configuredStorageProfiles, hasS3Profile, resolveStorageProfile, type StorageProfile } from "./s3";
 
 export { MailboxDurableObject } from "./mailbox-do";
 
@@ -27,12 +28,28 @@ export default {
           service: "hyper-relay",
           runtime: "cloudflare-workers",
           storage: "s3-direct",
+          storage_profiles: configuredStorageProfiles(env),
         });
       }
 
-      const accessOk = await verifyAccessKey(request.headers.get(ACCESS_KEY_HEADER), env.RELAY_ACCESS_KEY);
-      if (!accessOk) {
-        return Response.json({ error: "unauthorized" }, { status: 401 });
+      const authResult = await verifyCloudAccessKey(request.headers.get(ACCESS_KEY_HEADER), env);
+      if (!authResult.allowed) {
+        return Response.json(
+          { error: authResult.error ?? "unauthorized" },
+          { status: authResult.status || 401 }
+        );
+      }
+
+      if (env.RATE_LIMITER && url.pathname.startsWith("/v1/relay/")) {
+        const rateLimitKey =
+          authResult.subject || request.headers.get("CF-Connecting-IP")?.trim() || "anon";
+        const outcome = await env.RATE_LIMITER.limit({ key: rateLimitKey });
+        if (!outcome.success) {
+          return Response.json(
+            { error: "rate_limited" },
+            { status: 429, headers: { "Retry-After": "60" } }
+          );
+        }
       }
 
       const prefix = "/v1/relay/mailboxes/";
@@ -44,9 +61,27 @@ export default {
         return Response.json({ error: "invalid_path" }, { status: 400 });
       }
 
+      // Strip any client-supplied X-Internal-* headers before attaching trusted routing metadata.
+      const forwardedHeaders = new Headers(request.headers);
+      for (const headerName of Array.from(forwardedHeaders.keys())) {
+        if (headerName.toLowerCase().startsWith("x-internal-")) {
+          forwardedHeaders.delete(headerName);
+        }
+      }
+
+      const cfCountry = (request as Request & { cf?: { country?: string } }).cf?.country?.toUpperCase();
+      const preferredProfile: StorageProfile = cfCountry === "CN" && hasS3Profile(env, "cn") ? "cn" : "global";
+      const storageProfile = resolveStorageProfile(env, preferredProfile);
+      forwardedHeaders.set("X-Internal-Storage-Profile", storageProfile);
+
+      if (authResult.maxTransferBytes && authResult.maxTransferBytes > 0) {
+        forwardedHeaders.set("X-Internal-Max-Transfer-Bytes", String(authResult.maxTransferBytes));
+      }
+
       const mailboxId = parts[0];
       const stub = env.MAILBOX_DO.get(env.MAILBOX_DO.idFromName(mailboxId));
-      return await stub.fetch(request);
+      const forwardedRequest = new Request(request, { headers: forwardedHeaders });
+      return await stub.fetch(forwardedRequest);
     } catch (err) {
       const message = err instanceof Error ? err.message : "unknown_error";
       console.error(JSON.stringify({ message: "unhandled worker error", error: message }));
