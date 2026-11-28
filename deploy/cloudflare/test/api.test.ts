@@ -79,16 +79,33 @@ describe("Cloudflare Worker + Durable Object Direct-to-S3 Relay API", () => {
   const mockGlobalObjects = new Map<string, Uint8Array>();
   const mockCnObjects = new Map<string, Uint8Array>();
   let cloudHandler: ((req: Request) => Promise<Response>) | null = null;
+  let onStorageDelete: ((path: string) => Promise<void>) | null = null;
 
-  function handleMockS3(store: Map<string, Uint8Array>, req: Request, url: URL): Promise<Response> | Response {
+  async function objectETag(obj: Uint8Array): Promise<string> {
+    return `"${bytesToHex(await sha256(obj))}"`;
+  }
+
+  async function handleMockS3(store: Map<string, Uint8Array>, req: Request, url: URL): Promise<Response> {
     if (req.method === "PUT") {
+      const copySource = req.headers.get("x-amz-copy-source");
+      if (copySource) {
+        if (!(req.headers.get("Authorization") ?? "").startsWith("AWS4-HMAC-SHA256 ")) {
+          return new Response(null, { status: 403 });
+        }
+        const source = store.get(copySource);
+        if (!source) return new Response(null, { status: 404 });
+        if (req.headers.get("x-amz-copy-source-if-match") !== await objectETag(source)) {
+          return new Response(null, { status: 412 });
+        }
+        store.set(url.pathname, source.slice());
+        return new Response("<CopyObjectResult></CopyObjectResult>");
+      }
       if (!url.searchParams.get("X-Amz-Signature")) {
         return new Response("forbidden", { status: 403 });
       }
-      return req.arrayBuffer().then((ab) => {
-        store.set(url.pathname, new Uint8Array(ab));
-        return new Response(null, { status: 200, headers: { ETag: '"mock-etag"' } });
-      });
+      const obj = new Uint8Array(await req.arrayBuffer());
+      store.set(url.pathname, obj);
+      return new Response(null, { status: 200, headers: { ETag: await objectETag(obj) } });
     }
     if (req.method === "HEAD") {
       if (!(req.headers.get("Authorization") ?? "").startsWith("AWS4-HMAC-SHA256 ")) {
@@ -98,7 +115,7 @@ describe("Cloudflare Worker + Durable Object Direct-to-S3 Relay API", () => {
       if (!obj) return new Response(null, { status: 404 });
       return new Response(null, {
         status: 200,
-        headers: { "Content-Length": String(obj.byteLength), ETag: '"mock-etag"' },
+        headers: { "Content-Length": String(obj.byteLength), ETag: await objectETag(obj) },
       });
     }
     if (req.method === "GET") {
@@ -113,6 +130,7 @@ describe("Cloudflare Worker + Durable Object Direct-to-S3 Relay API", () => {
       if (!(req.headers.get("Authorization") ?? "").startsWith("AWS4-HMAC-SHA256 ")) {
         return new Response(null, { status: 403 });
       }
+      await onStorageDelete?.(url.pathname);
       store.delete(url.pathname);
       return new Response(null, { status: 204 });
     }
@@ -123,6 +141,7 @@ describe("Cloudflare Worker + Durable Object Direct-to-S3 Relay API", () => {
     mockGlobalObjects.clear();
     mockCnObjects.clear();
     cloudHandler = null;
+    onStorageDelete = null;
     clearCloudVerifyCache();
 
     const origFetch = globalThis.fetch.bind(globalThis);
@@ -290,7 +309,7 @@ describe("Cloudflare Worker + Durable Object Direct-to-S3 Relay API", () => {
       );
       expect(commitResp.status).toBe(204);
     }
-    expect(mockGlobalObjects.size).toBe(2);
+    expect(mockGlobalObjects.size).toBe(4);
     expect(mockCnObjects.size).toBe(0);
 
     // 4. Verify SSE Last-Event-ID replays chunk_ready events.
@@ -312,7 +331,24 @@ describe("Cloudflare Worker + Durable Object Direct-to-S3 Relay API", () => {
     await reader.cancel();
     expect(buf).toContain("event: chunk_ready");
 
-    // 5. Receiver obtains presigned GET URL and downloads directly from S3.
+    // 5. Simulate an older transfer that recorded only the size for its first chunk.
+    const stub = env.MAILBOX_DO.get(env.MAILBOX_DO.idFromName(mailboxId));
+    const previousKey = await runInDurableObject(stub, (_instance, state) => {
+      const { chunk_sizes_json } = state.storage.sql.exec<{ chunk_sizes_json: string }>(
+        "SELECT chunk_sizes_json FROM transfers_v2 WHERE transfer_id = ?", liveEnv.transfer_id
+      ).one();
+      const sizes = JSON.parse(chunk_sizes_json) as Record<string, number | { size: number; key: string }>;
+      const first = sizes[0];
+      if (typeof first === "number") throw new Error("Expected a committed object");
+      sizes[0] = first.size;
+      state.storage.sql.exec(
+        "UPDATE transfers_v2 SET chunk_sizes_json = ? WHERE transfer_id = ?", JSON.stringify(sizes), liveEnv.transfer_id
+      );
+      return first.key;
+    });
+    mockGlobalObjects.delete(`/unic-global-bucket/${previousKey}`);
+
+    // The receiver obtains a presigned GET for a copy of the legacy chunk.
     const dlPath = `/v1/relay/mailboxes/${mailboxId}/transfers/${liveEnv.transfer_id}/chunks/0`;
     const dlResp = await SELF.fetch(`${ORIGIN}${dlPath}`, {
       method: "GET",
@@ -321,6 +357,7 @@ describe("Cloudflare Worker + Durable Object Direct-to-S3 Relay API", () => {
     expect(dlResp.status).toBe(200);
     const dlGrant = (await dlResp.json()) as { method: string; url: string; size: number };
     expect(dlGrant.method).toBe("GET");
+    expect(new URL(dlGrant.url).pathname).not.toBe(new URL(created.upload_urls[0].url).pathname);
     const directGet = await fetch(dlGrant.url);
     expect(directGet.status).toBe(200);
     expect(new Uint8Array(await directGet.arrayBuffer())).toEqual(hexToBytes(vector.transfer.ciphertexts_hex[0]));
@@ -332,6 +369,104 @@ describe("Cloudflare Worker + Durable Object Direct-to-S3 Relay API", () => {
       headers: await signOwnerHeaders(owner, "POST", ackPath, new Uint8Array(0), "cf-nonce-ack-1"),
     });
     expect(ackResp.status).toBe(204);
+    expect(mockGlobalObjects.size).toBe(0);
+  });
+
+  it.each([
+    { code: "payload_too_large", status: 413, size: 1024 * 1024 + 1 },
+    { code: "chunk_too_large", status: 413, size: 1024 * 1024 + 17 },
+    { code: "size_mismatch", status: 400, size: 0 },
+  ])("isolates downloads and clears only the rejected chunk ($code)", async ({ code, status, size }) => {
+    const owner = await importSeedKey(vector.keys.recipient.seed);
+    const mailboxId = (await deriveMailboxId(ORIGIN, owner.pub))!;
+    const token = "delivery-token-chunk-commit-check";
+    const mib = 1024 * 1024;
+    const transfersPath = `/v1/relay/mailboxes/${mailboxId}/transfers`;
+    const senderPath = `/v1/relay/mailboxes/${mailboxId}/senders/${await tokenHashHex(token)}`;
+    const ownerFetch = async (path: string, method = "GET") => SELF.fetch(`${ORIGIN}${path}`, {
+      method,
+      headers: await signOwnerHeaders(owner, method, path, new Uint8Array(0), crypto.randomUUID()),
+    });
+    expect((await ownerFetch(senderPath, "PUT")).status).toBe(204);
+
+    const envelope = {
+      ...vector.transfer.envelope,
+      transfer_id: crypto.randomUUID().replaceAll("-", ""),
+      expires_ms: Date.now() + 60_000,
+      chunk_size: mib,
+      total_ciphertext_bytes: 2 * mib,
+    };
+    const senderHeaders = { Authorization: `Bearer ${token}` };
+    const create = await SELF.fetch(`${ORIGIN}${transfersPath}`, {
+      method: "POST",
+      headers: senderHeaders,
+      body: JSON.stringify(envelope),
+    });
+    expect(create.status).toBe(200);
+    const { upload_urls: uploads } = await create.json<{ upload_urls: { url: string }[] }>();
+    const transferPath = `${transfersPath}/${envelope.transfer_id}`;
+    const chunkPath = (index: number) => `${transferPath}/chunks/${index}`;
+    const upload = async (index: number, count: number, value: number) => {
+      expect((await fetch(uploads[index].url, { method: "PUT", body: new Uint8Array(count).fill(value) })).status)
+        .toBe(200);
+    };
+    const commit = (index: number) => SELF.fetch(`${ORIGIN}${chunkPath(index)}/commit`, {
+      method: "POST",
+      headers: senderHeaders,
+    });
+    const getGrant = async (index: number) => {
+      const response = await ownerFetch(chunkPath(index));
+      expect(response.status).toBe(200);
+      return response.json<{ url: string; size: number }>();
+    };
+    const expectDownload = async (grant: { url: string; size: number }, count: number, value: number) => {
+      expect(grant.size).toBe(count);
+      const download = await fetch(grant.url);
+      expect(download.status).toBe(200);
+      const bytes = new Uint8Array(await download.arrayBuffer());
+      expect(bytes.byteLength).toBe(count);
+      expect(bytes.every((byte) => byte === value)).toBe(true);
+    };
+
+    await upload(0, mib, 10);
+    await upload(1, mib, 20);
+    expect((await commit(0)).status).toBe(204);
+    expect((await commit(1)).status).toBe(204);
+    const firstGrant = await getGrant(0);
+    expect((await commit(0)).status).toBe(204);
+    await expectDownload(firstGrant, mib, 10);
+    await expectDownload(await getGrant(1), mib, 20);
+
+    // The sender may reuse its PUT grant. Existing and new GET grants still return the committed bytes.
+    await upload(0, size, 30);
+    await expectDownload(firstGrant, mib, 10);
+    await expectDownload(await getGrant(0), mib, 10);
+
+    // Commit a replacement for the other index while deletion of the rejected upload is in flight.
+    const rejectedPath = new URL(uploads[0].url).pathname;
+    await upload(1, mib - 1, 40);
+    onStorageDelete = async (path) => {
+      if (path === rejectedPath) expect((await commit(1)).status).toBe(204);
+    };
+    const rejected = await commit(0);
+    onStorageDelete = null;
+    expect(rejected.status).toBe(status);
+    expect(await rejected.json()).toEqual({ error: code });
+    expect((await ownerFetch(chunkPath(0))).status).toBe(404);
+    expect((await fetch(firstGrant.url)).status).toBe(404);
+    await expectDownload(await getGrant(1), mib - 1, 40);
+    const listed = await ownerFetch(transfersPath);
+    const { transfers } = await listed.json<{ transfers: { transfer_id: string; available_bitmap: string }[] }>();
+    expect(transfers.find((tr) => tr.transfer_id === envelope.transfer_id)?.available_bitmap).toBe("Ag");
+
+    // The rejected size no longer reserves bytes when the surviving chunk is recommitted.
+    await upload(1, mib + 1, 50);
+    expect((await commit(1)).status).toBe(204);
+    await upload(0, mib - 1, 60);
+    expect((await commit(0)).status).toBe(204);
+    await expectDownload(await getGrant(0), mib - 1, 60);
+    await expectDownload(await getGrant(1), mib + 1, 50);
+    expect((await ownerFetch(`${transferPath}/ack`, "POST")).status).toBe(204);
     expect(mockGlobalObjects.size).toBe(0);
   });
 

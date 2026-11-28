@@ -28,6 +28,7 @@ import {
 } from "./crypto";
 import {
   loadS3ConfigForProfile,
+  type ObjectMeta,
   parseStorageProfile,
   resolveStorageProfile,
   S3Client,
@@ -65,6 +66,13 @@ type TransferRow = {
   expires_at_ms: number;
   storage_profile: string;
 };
+
+type CommittedChunk = { size: number; key: string; etag: string };
+type ChunkSizes = Record<string, number | CommittedChunk>;
+
+function readChunkSizes(tr: TransferRow): ChunkSizes {
+  return JSON.parse(tr.chunk_sizes_json) as ChunkSizes;
+}
 
 type SenderRow = {
   token_hash: string;
@@ -214,8 +222,8 @@ export class MailboxDurableObject extends DurableObject<Env> {
 
   private async sweepExpired(mailboxId: string | null, nowMs: number): Promise<void> {
     const expiredTransfers = this.ctx.storage.sql
-      .exec<Pick<TransferRow, "transfer_id" | "total_chunks" | "storage_profile">>(
-        "SELECT transfer_id, total_chunks, storage_profile FROM transfers_v2 WHERE expires_at_ms <= ?",
+      .exec<TransferRow>(
+        "SELECT * FROM transfers_v2 WHERE expires_at_ms <= ?",
         nowMs
       )
       .toArray();
@@ -234,13 +242,73 @@ export class MailboxDurableObject extends DurableObject<Env> {
               clients.set(profile, s3);
             }
             if (!s3) return Promise.resolve();
-            return s3.deleteTransfer(mbId, tr.transfer_id, tr.total_chunks);
+            return this.deleteTransferObjects(s3, mbId, tr);
           })
         );
       }
     }
 
     this.ctx.storage.sql.exec("DELETE FROM nonces WHERE expires_at_ms <= ?", nowMs);
+  }
+
+  private getTransfer(transferId: string): TransferRow | undefined {
+    return this.ctx.storage.sql
+      .exec<TransferRow>("SELECT * FROM transfers_v2 WHERE transfer_id = ?", transferId)
+      .toArray()[0];
+  }
+
+  private getCurrentTransfer(previous: TransferRow): TransferRow | undefined {
+    const current = this.getTransfer(previous.transfer_id);
+    if (!current ||
+        current.envelope_json !== previous.envelope_json ||
+        current.expires_at_ms !== previous.expires_at_ms ||
+        current.sender_hash !== previous.sender_hash ||
+        current.storage_profile !== previous.storage_profile) return undefined;
+    return current;
+  }
+
+  private saveChunkState(transferId: string, availableB64: string, sizes: ChunkSizes): void {
+    this.ctx.storage.sql.exec(
+      "UPDATE transfers_v2 SET available_b64 = ?, chunk_sizes_json = ? WHERE transfer_id = ?",
+      availableB64,
+      JSON.stringify(sizes),
+      transferId
+    );
+  }
+
+  private async deleteTransferObjects(s3: S3Client, mailboxId: string, tr: TransferRow): Promise<void> {
+    const keys = Object.values(readChunkSizes(tr)).flatMap((chunk) => typeof chunk === "number" ? [] : [chunk.key]);
+    await s3.deleteTransfer(mailboxId, tr.transfer_id, tr.total_chunks, keys);
+  }
+
+  private async snapshotChunk(s3: S3Client, uploadKey: string, meta: ObjectMeta): Promise<CommittedChunk> {
+    // No upload grant can write this key, including grants issued before the commit.
+    const key = `${uploadKey}/committed/${crypto.randomUUID()}`;
+    try {
+      await s3.copyObject(uploadKey, key, meta.etag);
+      const snapshot = await s3.headObject(key);
+      if (snapshot?.size !== meta.size) throw new Error("Chunk size changed during copy");
+      return { size: snapshot.size, key, etag: meta.etag };
+    } catch (error) {
+      await s3.deleteObject(key).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private async removeRejectedChunk(s3: S3Client, uploadKey: string, previous: TransferRow, index: number): Promise<void> {
+    await s3.deleteObject(uploadKey).catch(() => undefined);
+    const tr = this.getCurrentTransfer(previous);
+    if (!tr) return;
+
+    const bm = decodeBitmap(tr.available_b64, tr.total_chunks) ?? newBitmap(tr.total_chunks);
+    bm[index >>> 3] &= ~(1 << (index & 7));
+    const sizes = readChunkSizes(tr);
+    const rejected = sizes[index];
+    delete sizes[index];
+    this.saveChunkState(tr.transfer_id, encodeBitmap(bm), sizes);
+    if (rejected && typeof rejected !== "number") {
+      await s3.deleteObject(rejected.key).catch(() => undefined);
+    }
   }
 
   override async alarm(): Promise<void> {
@@ -624,11 +692,8 @@ export class MailboxDurableObject extends DurableObject<Env> {
     const nowMs = Date.now();
     await this.sweepExpired(mailboxId, nowMs);
 
-    const rows = this.ctx.storage.sql
-      .exec<TransferRow>("SELECT * FROM transfers_v2 WHERE transfer_id = ?", transferId)
-      .toArray();
-    if (rows.length === 0) return jsonErr(404, "not_found");
-    const tr = rows[0];
+    const tr = this.getTransfer(transferId);
+    if (!tr) return jsonErr(404, "not_found");
     if (tr.sender_hash !== sender.token_hash) return jsonErr(403, "forbidden");
     if (index < 0 || index >= tr.total_chunks) return jsonErr(400, "invalid_chunk_index");
 
@@ -657,11 +722,8 @@ export class MailboxDurableObject extends DurableObject<Env> {
     const nowMs = Date.now();
     await this.sweepExpired(mailboxId, nowMs);
 
-    const rows = this.ctx.storage.sql
-      .exec<TransferRow>("SELECT * FROM transfers_v2 WHERE transfer_id = ?", transferId)
-      .toArray();
-    if (rows.length === 0) return jsonErr(404, "not_found");
-    const tr = rows[0];
+    const tr = this.getTransfer(transferId);
+    if (!tr) return jsonErr(404, "not_found");
     if (tr.sender_hash !== sender.token_hash) return jsonErr(403, "forbidden");
     if (index < 0 || index >= tr.total_chunks) return jsonErr(400, "invalid_chunk_index");
 
@@ -679,35 +741,52 @@ export class MailboxDurableObject extends DurableObject<Env> {
 
     const maxChunk = tr.chunk_size + GCM_TAG_SIZE;
     if (meta.size <= 0 || meta.size > maxChunk || (tr.total_chunks === 1 && meta.size !== tr.total_ciphertext_bytes)) {
-      await s3.deleteObject(key).catch(() => undefined);
+      await this.removeRejectedChunk(s3, key, tr, index);
       return meta.size > maxChunk ? jsonErr(413, "chunk_too_large") : jsonErr(400, "size_mismatch");
     }
 
-    const postRows = this.ctx.storage.sql
-      .exec<TransferRow>("SELECT * FROM transfers_v2 WHERE transfer_id = ?", transferId)
-      .toArray();
-    if (postRows.length === 0) {
-      await s3.deleteObject(key).catch(() => undefined);
+    const beforeCopy = this.getCurrentTransfer(tr);
+    if (!beforeCopy) return jsonErr(410, "gone");
+    const committed = readChunkSizes(beforeCopy)[index];
+    if (committed && typeof committed !== "number" && committed.size === meta.size && committed.etag === meta.etag) {
+      return new Response(null, { status: 204 });
+    }
+
+    let snapshot: CommittedChunk;
+    try {
+      snapshot = await this.snapshotChunk(s3, key, meta);
+    } catch {
+      return jsonErr(502, "storage_error");
+    }
+
+    const latest = this.getCurrentTransfer(tr);
+    if (!latest) {
+      await s3.deleteObject(snapshot.key).catch(() => undefined);
       return jsonErr(410, "gone");
     }
-    const latest = postRows[0];
-    const bm = decodeBitmap(latest.available_b64, latest.total_chunks) ?? newBitmap(latest.total_chunks);
-    setBit(bm, index);
-    const updatedB64 = encodeBitmap(bm);
-    const sizes = JSON.parse(latest.chunk_sizes_json) as Record<string, number>;
-    sizes[String(index)] = meta.size;
-    const total = Object.values(sizes).reduce((bytes, size) => bytes + size, 0);
+    const sizes = readChunkSizes(latest);
+    const previous = sizes[index];
+    if (previous && typeof previous !== "number" && previous.size === snapshot.size && previous.etag === snapshot.etag) {
+      await s3.deleteObject(snapshot.key).catch(() => undefined);
+      return new Response(null, { status: 204 });
+    }
+    sizes[index] = snapshot;
+    const total = Object.values(sizes).reduce<number>(
+      (bytes, chunk) => bytes + (typeof chunk === "number" ? chunk : chunk.size),
+      0
+    );
     if (total > latest.total_ciphertext_bytes) {
-      await s3.deleteObject(key).catch(() => undefined);
+      await Promise.all([
+        this.removeRejectedChunk(s3, key, tr, index),
+        s3.deleteObject(snapshot.key).catch(() => undefined),
+      ]);
       return jsonErr(413, "payload_too_large");
     }
 
-    this.ctx.storage.sql.exec(
-      "UPDATE transfers_v2 SET available_b64 = ?, chunk_sizes_json = ? WHERE transfer_id = ?",
-      updatedB64,
-      JSON.stringify(sizes),
-      transferId
-    );
+    const bm = decodeBitmap(latest.available_b64, latest.total_chunks) ?? newBitmap(latest.total_chunks);
+    setBit(bm, index);
+    const updatedB64 = encodeBitmap(bm);
+    this.saveChunkState(transferId, updatedB64, sizes);
 
     this.publishEvent({
       event: "chunk_ready",
@@ -717,6 +796,9 @@ export class MailboxDurableObject extends DurableObject<Env> {
       expires_at_ms: latest.expires_at_ms,
     });
 
+    if (previous && typeof previous !== "number") {
+      await s3.deleteObject(previous.key).catch(() => undefined);
+    }
     return new Response(null, { status: 204 });
   }
 
@@ -746,20 +828,43 @@ export class MailboxDurableObject extends DurableObject<Env> {
 
     const nowMs = Date.now();
     await this.sweepExpired(mailboxId, nowMs);
-    const rows = this.ctx.storage.sql
-      .exec<TransferRow>("SELECT * FROM transfers_v2 WHERE transfer_id = ?", transferId)
-      .toArray();
-    if (rows.length === 0) return jsonErr(404, "not_found");
-    const tr = rows[0];
+    const tr = this.getTransfer(transferId);
+    if (!tr) return jsonErr(404, "not_found");
     const bm = decodeBitmap(tr.available_b64, tr.total_chunks);
     if (!bm || !hasBit(bm, index)) return jsonErr(404, "not_found");
 
     const s3 = this.getS3ClientForProfile(parseStorageProfile(tr.storage_profile));
     if (!s3) return jsonErr(503, "s3_not_configured");
 
-    const sizes = JSON.parse(tr.chunk_sizes_json) as Record<string, number>;
+    let chunk = readChunkSizes(tr)[index];
+    if (chunk === undefined) return jsonErr(404, "not_found");
+    if (typeof chunk === "number") {
+      // Older transfers recorded only a size. Pin the object before issuing another grant.
+      const key = s3.objectKey(mailboxId, transferId, index);
+      let snapshot: CommittedChunk;
+      try {
+        const meta = await s3.headObject(key);
+        if (!meta || meta.size !== chunk) return jsonErr(404, "not_found");
+        snapshot = await this.snapshotChunk(s3, key, meta);
+      } catch {
+        return jsonErr(502, "storage_error");
+      }
+      const latest = this.getCurrentTransfer(tr);
+      const sizes = latest && readChunkSizes(latest);
+      if (latest && sizes && sizes[index] === chunk) {
+        sizes[index] = snapshot;
+        this.saveChunkState(transferId, latest.available_b64, sizes);
+        chunk = snapshot;
+      } else {
+        const current = sizes?.[index];
+        await s3.deleteObject(snapshot.key).catch(() => undefined);
+        if (current === undefined || typeof current === "number") return jsonErr(404, "not_found");
+        chunk = current;
+      }
+    }
+
     const signed = await s3.presignGet(
-      s3.objectKey(mailboxId, transferId, index),
+      chunk.key,
       this.presignTtlFor(nowMs, tr.expires_at_ms, s3.presignTtlSec),
       nowMs
     );
@@ -768,7 +873,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
       method: signed.method,
       url: signed.url,
       expires_at_ms: signed.expires_at_ms,
-      size: sizes[String(index)] ?? 0,
+      size: chunk.size,
     });
   }
 
@@ -779,17 +884,12 @@ export class MailboxDurableObject extends DurableObject<Env> {
     const authErr = await this.verifyOwner(request, mailboxId, body);
     if (authErr) return authErr;
 
-    const rows = this.ctx.storage.sql
-      .exec<Pick<TransferRow, "total_chunks" | "storage_profile">>(
-        "SELECT total_chunks, storage_profile FROM transfers_v2 WHERE transfer_id = ?",
-        transferId
-      )
-      .toArray();
-    if (rows.length > 0) {
+    const tr = this.getTransfer(transferId);
+    if (tr) {
       this.ctx.storage.sql.exec("DELETE FROM transfers_v2 WHERE transfer_id = ?", transferId);
-      const s3 = this.getS3ClientForProfile(parseStorageProfile(rows[0].storage_profile));
+      const s3 = this.getS3ClientForProfile(parseStorageProfile(tr.storage_profile));
       if (s3) {
-        await s3.deleteTransfer(mailboxId, transferId, rows[0].total_chunks);
+        await this.deleteTransferObjects(s3, mailboxId, tr);
       }
       await this.scheduleNextAlarm();
     }
@@ -802,38 +902,19 @@ export class MailboxDurableObject extends DurableObject<Env> {
       const sender = await this.authorizeSender(tok);
       if (!sender) return jsonErr(403, "forbidden");
 
-      const rows = this.ctx.storage.sql
-        .exec<Pick<TransferRow, "sender_hash" | "total_chunks" | "storage_profile">>(
-          "SELECT sender_hash, total_chunks, storage_profile FROM transfers_v2 WHERE transfer_id = ?",
-          transferId
-        )
-        .toArray();
-      if (rows.length > 0) {
-        if (rows[0].sender_hash !== sender.token_hash) return jsonErr(403, "forbidden");
-        this.ctx.storage.sql.exec("DELETE FROM transfers_v2 WHERE transfer_id = ?", transferId);
-        const s3 = this.getS3ClientForProfile(parseStorageProfile(rows[0].storage_profile));
-        if (s3) {
-          await s3.deleteTransfer(mailboxId, transferId, rows[0].total_chunks);
-        }
-        await this.scheduleNextAlarm();
-      }
-      return new Response(null, { status: 204 });
+      const tr = this.getTransfer(transferId);
+      if (tr && tr.sender_hash !== sender.token_hash) return jsonErr(403, "forbidden");
+    } else {
+      const authErr = await this.verifyOwner(request, mailboxId, new Uint8Array(0));
+      if (authErr) return authErr;
     }
 
-    const authErr = await this.verifyOwner(request, mailboxId, new Uint8Array(0));
-    if (authErr) return authErr;
-
-    const rows = this.ctx.storage.sql
-      .exec<Pick<TransferRow, "total_chunks" | "storage_profile">>(
-        "SELECT total_chunks, storage_profile FROM transfers_v2 WHERE transfer_id = ?",
-        transferId
-      )
-      .toArray();
-    if (rows.length > 0) {
+    const tr = this.getTransfer(transferId);
+    if (tr) {
       this.ctx.storage.sql.exec("DELETE FROM transfers_v2 WHERE transfer_id = ?", transferId);
-      const s3 = this.getS3ClientForProfile(parseStorageProfile(rows[0].storage_profile));
+      const s3 = this.getS3ClientForProfile(parseStorageProfile(tr.storage_profile));
       if (s3) {
-        await s3.deleteTransfer(mailboxId, transferId, rows[0].total_chunks);
+        await this.deleteTransferObjects(s3, mailboxId, tr);
       }
       await this.scheduleNextAlarm();
     }
