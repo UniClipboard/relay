@@ -49,6 +49,56 @@ jobs:
       - run: npm run typecheck
       - run: npm test
 
+  deploy-production:
+    name: Deploy production Cloudflare Worker
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: cloudflare-worker
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: production
+      url: https://relay.uniclipboard.app
+    concurrency:
+      group: relay-worker-production
+      queue: max
+    defaults:
+      run:
+        working-directory: deploy/cloudflare
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: deploy/cloudflare/package-lock.json
+      - run: npm ci
+      - name: Deploy the current main commit
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          main_ref=$(git ls-remote --exit-code origin refs/heads/main)
+          if [[ ${main_ref%%$'\t'*} != "$GITHUB_SHA" ]]; then
+            echo "::error::This run was superseded by a newer main commit."
+            exit 1
+          fi
+          : "${CLOUDFLARE_ACCOUNT_ID:?Set CLOUDFLARE_ACCOUNT_ID in the production environment}"
+          : "${CLOUDFLARE_API_TOKEN:?Set CLOUDFLARE_API_TOKEN in the production environment}"
+          npm run deploy -- --env production --message "$GITHUB_SHA"
+      - name: Check the production health endpoint
+        run: |
+          curl --fail --silent --show-error --retry 5 --retry-all-errors --max-time 10 \
+            https://relay.uniclipboard.app/healthz -o "$RUNNER_TEMP/relay-health.json"
+          jq -e '.status == "ok" and .service == "hyper-relay" and
+            .runtime == "cloudflare-workers" and .storage == "s3-direct" and
+            (.storage_profiles | index("global") != null)' "$RUNNER_TEMP/relay-health.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: relay-production-health
+          path: ${{ runner.temp }}/relay-health.json
+
   docker:
     name: Build container & healthcheck
     runs-on: ubuntu-latest
