@@ -30,6 +30,7 @@ import {
   loadS3ConfigForProfile,
   type ObjectMeta,
   parseStorageProfile,
+  type PresignedURL,
   resolveStorageProfile,
   S3Client,
   type StorageProfile,
@@ -69,6 +70,7 @@ type TransferRow = {
 
 type CommittedChunk = { size: number; key: string; etag: string };
 type ChunkSizes = Record<string, number | CommittedChunk>;
+type DownloadGrant = PresignedURL & { size: number };
 
 function readChunkSizes(tr: TransferRow): ChunkSizes {
   return JSON.parse(tr.chunk_sizes_json) as ChunkSizes;
@@ -387,7 +389,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
     return rows.length > 0 ? rows[0] : null;
   }
 
-  private publishEvent(evt: Omit<SSEEvent, "id">): void {
+  private publishEvent(evt: Omit<SSEEvent, "id">, downloadGrant?: DownloadGrant): void {
     const inserted = this.ctx.storage.sql
       .exec<{ id: number }>(
         "INSERT INTO events (event, payload_json) VALUES (?, ?) RETURNING id",
@@ -403,7 +405,13 @@ export class MailboxDurableObject extends DurableObject<Env> {
 
     this.ctx.storage.sql.exec("DELETE FROM events WHERE id <= ?", inserted.id - DEFAULT_EVENT_BUFFER);
 
-    const frame = utf8Bytes(`id: ${fullEvent.id}\nevent: ${fullEvent.event}\ndata: ${JSON.stringify(fullEvent)}\n\n`);
+    if (this.subscribers.size === 0) return;
+
+    // Only streams that passed owner authentication receive the live frame.
+    const liveEvent = downloadGrant && downloadGrant.expires_at_ms > Date.now()
+      ? { ...fullEvent, download_grant: downloadGrant }
+      : fullEvent;
+    const frame = utf8Bytes(`id: ${fullEvent.id}\nevent: ${fullEvent.event}\ndata: ${JSON.stringify(liveEvent)}\n\n`);
     for (const sub of this.subscribers) {
       try {
         sub.send(frame);
@@ -411,6 +419,13 @@ export class MailboxDurableObject extends DurableObject<Env> {
         this.subscribers.delete(sub);
       }
     }
+  }
+
+  private async presignDownload(
+    s3: S3Client, chunk: CommittedChunk, expiresAtMs: number, nowMs: number
+  ): Promise<DownloadGrant> {
+    const signed = await s3.presignGet(chunk.key, this.presignTtlFor(nowMs, expiresAtMs, s3.presignTtlSec), nowMs);
+    return { ...signed, size: chunk.size };
   }
 
   private validateEnvelope(env: Envelope, maxBytes: number, nowMs: number): { expiresAtMs: number } | Response {
@@ -759,6 +774,14 @@ export class MailboxDurableObject extends DurableObject<Env> {
       return jsonErr(502, "storage_error");
     }
 
+    // Sign before re-reading the transfer so the state update and live publication stay synchronous.
+    const signAtMs = Date.now();
+    const canSendGrant = tr.total_chunks === 1 && index === 0 && this.subscribers.size > 0 &&
+      tr.expires_at_ms - signAtMs >= 1000;
+    const downloadGrant = canSendGrant
+      ? await this.presignDownload(s3, snapshot, tr.expires_at_ms, signAtMs).catch(() => undefined)
+      : undefined;
+
     const latest = this.getCurrentTransfer(tr);
     if (!latest) {
       await s3.deleteObject(snapshot.key).catch(() => undefined);
@@ -794,7 +817,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
       chunk_index: index,
       available_bitmap: updatedB64,
       expires_at_ms: latest.expires_at_ms,
-    });
+    }, downloadGrant);
 
     if (previous && typeof previous !== "number") {
       await s3.deleteObject(previous.key).catch(() => undefined);
@@ -863,18 +886,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
       }
     }
 
-    const signed = await s3.presignGet(
-      chunk.key,
-      this.presignTtlFor(nowMs, tr.expires_at_ms, s3.presignTtlSec),
-      nowMs
-    );
-
-    return Response.json({
-      method: signed.method,
-      url: signed.url,
-      expires_at_ms: signed.expires_at_ms,
-      size: chunk.size,
-    });
+    return Response.json(await this.presignDownload(s3, chunk, tr.expires_at_ms, nowMs));
   }
 
   private async handleAckTransfer(request: Request, mailboxId: string, transferId: string): Promise<Response> {
@@ -995,7 +1007,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
       status: 200,
       headers: {
         "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
+        "Cache-Control": "no-store",
         Connection: "keep-alive",
       },
     });

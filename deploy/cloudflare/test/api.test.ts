@@ -75,6 +75,12 @@ function withCfCountry(req: Request, country: string): Request {
   return req;
 }
 
+async function readSSEFrame(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<string> {
+  const { value, done } = await reader.read();
+  if (done) throw new Error("Expected an SSE frame");
+  return new TextDecoder().decode(value);
+}
+
 describe("Cloudflare Worker + Durable Object Direct-to-S3 Relay API", () => {
   const mockGlobalObjects = new Map<string, Uint8Array>();
   const mockCnObjects = new Map<string, Uint8Array>();
@@ -294,26 +300,40 @@ describe("Cloudflare Worker + Durable Object Direct-to-S3 Relay API", () => {
     expect(created.upload_urls).toHaveLength(2);
     expect(new URL(created.upload_urls[0].url).origin).toBe(MOCK_S3_ORIGIN);
 
-    // 3. Direct PUT both chunks to mock S3, then commit via relay.
-    for (let i = 0; i < vector.transfer.ciphertexts_hex.length; i++) {
-      const ct = hexToBytes(vector.transfer.ciphertexts_hex[i]);
-      const directPut = await fetch(created.upload_urls[i].url, { method: "PUT", body: ct });
-      expect(directPut.status).toBe(200);
+    // 3. Direct PUT both chunks, then verify live commits carry no download grants.
+    const ssePath = `/v1/relay/mailboxes/${mailboxId}/events`;
+    const live = await SELF.fetch(`${ORIGIN}${ssePath}`, {
+      headers: await signOwnerHeaders(owner, "GET", ssePath, new Uint8Array(0), "cf-nonce-sse-live"),
+    });
+    expect(live.status).toBe(200);
+    const liveReader = live.body!.getReader();
+    try {
+      expect(await readSSEFrame(liveReader)).toBe(": connected\n\n");
+      for (let i = 0; i < vector.transfer.ciphertexts_hex.length; i++) {
+        const ct = hexToBytes(vector.transfer.ciphertexts_hex[i]);
+        const directPut = await fetch(created.upload_urls[i].url, { method: "PUT", body: ct });
+        expect(directPut.status).toBe(200);
 
-      const commitResp = await SELF.fetch(
-        `${ORIGIN}/v1/relay/mailboxes/${mailboxId}/transfers/${liveEnv.transfer_id}/chunks/${i}/commit`,
-        {
-          method: "POST",
-          headers: { Authorization: `Bearer ${deliveryToken}` },
-        }
-      );
-      expect(commitResp.status).toBe(204);
+        const commitResp = await SELF.fetch(
+          `${ORIGIN}/v1/relay/mailboxes/${mailboxId}/transfers/${liveEnv.transfer_id}/chunks/${i}/commit`,
+          {
+            method: "POST",
+            headers: { Authorization: `Bearer ${deliveryToken}` },
+          }
+        );
+        expect(commitResp.status).toBe(204);
+        const frame = await readSSEFrame(liveReader);
+        expect(frame.includes("event: chunk_ready\n")).toBe(true);
+        expect(frame.includes(`"chunk_index":${i}`)).toBe(true);
+        expect(frame.includes("download_grant")).toBe(false);
+      }
+    } finally {
+      await liveReader.cancel();
     }
     expect(mockGlobalObjects.size).toBe(4);
     expect(mockCnObjects.size).toBe(0);
 
     // 4. Verify SSE Last-Event-ID replays chunk_ready events.
-    const ssePath = `/v1/relay/mailboxes/${mailboxId}/events`;
     const sseHeaders = await signOwnerHeaders(owner, "GET", ssePath, new Uint8Array(0), "cf-nonce-sse-replay");
     const sseResp = await SELF.fetch(`${ORIGIN}${ssePath}`, {
       method: "GET",
@@ -370,6 +390,133 @@ describe("Cloudflare Worker + Durable Object Direct-to-S3 Relay API", () => {
     });
     expect(ackResp.status).toBe(204);
     expect(mockGlobalObjects.size).toBe(0);
+  });
+
+  it.each([
+    { name: "global profile", country: "US", origin: MOCK_S3_ORIGIN, ttlMs: 600_000, failPresign: false },
+    { name: "CN profile", country: "CN", origin: MOCK_CN_S3_ORIGIN, ttlMs: 60_000, failPresign: false },
+    { name: "presign failure", country: "US", origin: MOCK_S3_ORIGIN, ttlMs: 60_000, failPresign: true },
+  ])("delivers a live single-chunk commit to the owner ($name)", async ({ country, origin, ttlMs, failPresign }) => {
+    const owner = await importSeedKey(vector.keys.recipient.seed);
+    const other = await importSeedKey(vector.keys.sender.seed);
+    const mailboxId = (await deriveMailboxId(ORIGIN, owner.pub))!;
+    const mailboxPath = `/v1/relay/mailboxes/${mailboxId}`;
+    const ssePath = `${mailboxPath}/events`;
+    const token = "delivery-token-inline-download-fixture";
+    const senderHeaders = { Authorization: `Bearer ${token}` };
+    const senderPath = `${mailboxPath}/senders/${await tokenHashHex(token)}`;
+    const ownerFetch = async (path: string, method = "GET", headers: Record<string, string> = {}) =>
+      SELF.fetch(`${ORIGIN}${path}`, {
+        method,
+        headers: { ...await signOwnerHeaders(owner, method, path, new Uint8Array(0), crypto.randomUUID()), ...headers },
+      });
+    expect((await ownerFetch(senderPath, "PUT")).status).toBe(204);
+    expect((await SELF.fetch(`${ORIGIN}${ssePath}`, { headers: senderHeaders })).status).toBe(401);
+    expect((await SELF.fetch(`${ORIGIN}${ssePath}`, {
+      headers: await signOwnerHeaders(other, "GET", ssePath, new Uint8Array(0), crypto.randomUUID()),
+    })).status).toBe(401);
+
+    const live = await ownerFetch(ssePath);
+    expect(live.status).toBe(200);
+    expect(live.headers.get("Cache-Control")).toBe("no-store");
+    const reader = live.body!.getReader();
+    try {
+      expect(await readSSEFrame(reader)).toBe(": connected\n\n");
+      const ciphertext = hexToBytes(vector.transfer.ciphertexts_hex[0]);
+      const now = Date.now();
+      const envelope = {
+        ...vector.transfer.envelope,
+        transfer_id: crypto.randomUUID().replaceAll("-", ""),
+        created_ms: now,
+        expires_ms: now + ttlMs,
+        total_chunks: 1,
+        chunk_size: ciphertext.length,
+        total_ciphertext_bytes: ciphertext.length,
+        chunk_hashes: [vector.transfer.envelope.chunk_hashes[0]],
+      };
+      const transfersPath = `${mailboxPath}/transfers`;
+      const transferPath = `${transfersPath}/${envelope.transfer_id}`;
+      const chunkPath = `${transferPath}/chunks/0`;
+      const create = await worker.fetch(withCfCountry(new Request(`${ORIGIN}${transfersPath}`, {
+        method: "POST",
+        headers: senderHeaders,
+        body: JSON.stringify(envelope),
+      }), country), env);
+      expect(create.status).toBe(200);
+      const { upload_urls: [upload] } = await create.json<{ upload_urls: { url: string }[] }>();
+      const announced = await readSSEFrame(reader);
+      expect(announced.includes("event: transfer_announced\n")).toBe(true);
+      expect(announced.includes("download_grant")).toBe(false);
+      expect((await fetch(upload.url, { method: "PUT", body: ciphertext })).status).toBe(200);
+
+      const presign = failPresign
+        ? vi.spyOn(S3Client.prototype, "presignGet").mockRejectedValueOnce(new Error("Test signing failure"))
+        : undefined;
+      const commitStarted = Date.now();
+      const commit = await worker.fetch(withCfCountry(new Request(`${ORIGIN}${chunkPath}/commit`, {
+        method: "POST",
+        headers: senderHeaders,
+      }), "US"), env);
+      expect(commit.status).toBe(204);
+      expect(await commit.text()).toBe("");
+      if (presign) {
+        expect(presign).toHaveBeenCalledTimes(1);
+        presign.mockRestore();
+      }
+
+      const frame = await readSSEFrame(reader);
+      expect(frame.includes("event: chunk_ready\n")).toBe(true);
+      type Grant = { method: string; url: string; size: number; expires_at_ms: number };
+      const { download_grant: inline, ...ready } = JSON.parse(frame.split("\n")[2].slice("data: ".length)) as {
+        id: string; event: string; transfer_id: string; chunk_index: number; download_grant?: Grant;
+      };
+      expect(ready).toMatchObject({ event: "chunk_ready", transfer_id: envelope.transfer_id, chunk_index: 0 });
+      expect(Boolean(inline)).toBe(!failPresign);
+
+      // A previously issued PUT still writes to staging after the commit.
+      expect((await fetch(upload.url, { method: "PUT", body: new Uint8Array(ciphertext.length) })).status).toBe(200);
+      const expectDownload = async (grant: Grant) => {
+        expect(grant.method).toBe("GET");
+        expect(grant.size).toBe(ciphertext.length);
+        expect(grant.expires_at_ms).toBeGreaterThan(commitStarted);
+        expect(grant.expires_at_ms).toBeLessThanOrEqual(envelope.expires_ms);
+        const url = new URL(grant.url);
+        expect(url.origin).toBe(origin);
+        expect(url.pathname.startsWith(`${new URL(upload.url).pathname}/committed/`)).toBe(true);
+        expect(Number(url.searchParams.get("X-Amz-Expires"))).toBeLessThanOrEqual(300);
+        const downloaded = await fetch(grant.url, { method: grant.method });
+        expect(downloaded.status).toBe(200);
+        expect(new Uint8Array(await downloaded.arrayBuffer())).toEqual(ciphertext);
+        return url.pathname;
+      };
+      const inlinePath = inline && await expectDownload(inline);
+
+      const stub = env.MAILBOX_DO.get(env.MAILBOX_DO.idFromName(mailboxId));
+      const stored = await runInDurableObject(stub, (_instance, state) => state.storage.sql
+        .exec<{ payload_json: string }>("SELECT payload_json FROM events WHERE id = ?", Number(ready.id))
+        .one().payload_json);
+      const { id, ...baseEvent } = ready;
+      expect(stored === JSON.stringify(baseEvent)).toBe(true);
+      const replay = await ownerFetch(ssePath, "GET", { "Last-Event-ID": String(Number(id) - 1) });
+      expect(replay.status).toBe(200);
+      const replayReader = replay.body!.getReader();
+      try {
+        expect(await readSSEFrame(replayReader)).toBe(": connected\n\n");
+        const replayedFrame = await readSSEFrame(replayReader);
+        expect(replayedFrame === `id: ${id}\nevent: chunk_ready\ndata: ${JSON.stringify(ready)}\n\n`).toBe(true);
+      } finally {
+        await replayReader.cancel();
+      }
+
+      expect((await SELF.fetch(`${ORIGIN}${chunkPath}`, { headers: senderHeaders })).status).toBe(401);
+      const legacy = await ownerFetch(chunkPath);
+      expect(legacy.status).toBe(200);
+      const legacyPath = await expectDownload(await legacy.json<Grant>());
+      if (inlinePath) expect(legacyPath).toBe(inlinePath);
+      expect((await ownerFetch(`${transferPath}/ack`, "POST")).status).toBe(204);
+    } finally {
+      await reader.cancel();
+    }
   });
 
   it.each([
