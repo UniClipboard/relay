@@ -1,6 +1,6 @@
 # Hyper Relay — Cloudflare Workers + Durable Objects (Direct to S3 / COS / R2)
 
-Zero-knowledge **Hyper Relay** control plane running on Cloudflare Workers + SQLite Durable Objects (sharded by `mailbox_id`). Clients upload and download AES-256-GCM ciphertext chunks **directly against configured S3-compatible object storage** (Tencent Cloud COS, Cloudflare R2, AWS S3, Aliyun OSS, MinIO) via short-lived SigV4 presigned URLs — zero chunk payload transits the Worker.
+Zero-knowledge **Hyper Relay** control plane running on Cloudflare Workers + SQLite Durable Objects (sharded by `mailbox_id`). Clients upload and download AES-256-GCM ciphertext chunks directly against configured S3-compatible object storage (Tencent Cloud COS, Cloudflare R2, AWS S3, Aliyun OSS, MinIO) via short-lived SigV4 presigned URLs. The official origin also supports authenticated fallback uploads.
 
 ## One-Click Deploy
 
@@ -64,6 +64,7 @@ The `env.production` block in `wrangler.jsonc` configures a single unified globa
 - **Cloud API Key Verification (`uc-cloud`)**
 - **Per-Transfer Geo-Routed Dual S3 Storage** (`"global"` Cloudflare R2 + optional `"cn"` Tencent Cloud COS)
 - **Worker-Level Rate Limiting** (`RATE_LIMITER`, 180 req/min keyed by Cloud `subject` or `CF-Connecting-IP`)
+- **Relay Upload Fallback** on the official HTTPS origin. The Worker uses the existing S3 endpoint and credentials for the transfer's selected profile. See the [upload contract](../../docs/hyper-api-v2.md#official-relay-upload-fallback).
 
 ### Cloud API Key Verification
 

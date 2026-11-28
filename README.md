@@ -2,7 +2,7 @@
 
 Headless, zero-knowledge relay microservices for self-hosted and official Cloud-managed [UniClipboard](https://github.com/UniClipboard/UniClipboard) deployments.
 
-No Web UI or management dashboard is included. **Hyper Relay** operates as a lightweight control plane where clients upload and download AES-256-GCM ciphertext chunks **directly against S3-compatible object storage** (Tencent Cloud COS, Cloudflare R2, AWS S3, Aliyun OSS, MinIO, Backblaze B2) via short-lived SigV4 presigned URLs — **zero chunk bandwidth transits the relay server**.
+No Web UI or management dashboard is included. **Hyper Relay** issues short-lived SigV4 presigned URLs so clients can upload and download AES-256-GCM ciphertext chunks directly against S3-compatible object storage (Tencent Cloud COS, Cloudflare R2, AWS S3, Aliyun OSS, MinIO, Backblaze B2). The official Cloudflare Worker also supports an authenticated upload fallback to the transfer's selected storage profile.
 
 ## Architecture Overview
 

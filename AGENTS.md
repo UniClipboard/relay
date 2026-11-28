@@ -22,7 +22,7 @@ Changes to container packaging (`Dockerfile`, `docker-compose.yml`) must pass a 
 
 - Keep `hyper-relay` and future `p2p-relay` strictly decoupled as independent headless microservices with no Web UI.
 - Both services must share credential & admission policy through `internal/auth` (`auth.Authorizer`, `RELAY_ACCESS_KEY`, `RELAY_ALLOWED_PUBKEYS`).
-- Hyper Relay issues short-lived S3 SigV4 presigned PUT/GET URLs so ciphertext chunk bytes never transit the relay server; cryptography must remain compatible with `vectors/hybrid-relay-v1.json`.
+- Hyper Relay uses short-lived S3 SigV4 presigned PUT/GET URLs for direct object storage traffic. The official Cloudflare Worker also accepts authenticated ciphertext uploads for transfers that use the upload fallback. Cryptography must remain compatible with `vectors/hybrid-relay-v1.json`.
 - Do not implement Tailcat DERP forwarding logic unless explicitly scoped; keep `cmd/p2p-relay` as a clean reserved boundary.
 
 ## Security

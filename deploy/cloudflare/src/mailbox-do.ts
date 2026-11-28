@@ -17,7 +17,9 @@ import {
   NONCE_REPLAY_WINDOW_MS,
   normalizeRelayOrigin,
   setBit,
+  sha256,
   SINGLE_CHUNK_THRESHOLD,
+  timingSafeEqualBytes,
   tokenHashHex,
   utf8Bytes,
   validHex64,
@@ -27,6 +29,7 @@ import {
   VERSION,
 } from "./crypto";
 import {
+  hasS3Profile,
   loadS3ConfigForProfile,
   type ObjectMeta,
   parseStorageProfile,
@@ -43,6 +46,7 @@ const DEFAULT_MAX_TRANSFERS = 32;
 const DEFAULT_EVENT_BUFFER = 128;
 const DEFAULT_KEEPALIVE_MS = 25_000;
 const MAX_INLINE_UPLOAD_URLS = 16;
+const OFFICIAL_RELAY_ORIGIN = "https://relay.uniclipboard.app";
 
 interface SSEEvent {
   id: string;
@@ -74,6 +78,13 @@ function readChunkSizes(tr: TransferRow): ChunkSizes {
   return JSON.parse(tr.chunk_sizes_json) as ChunkSizes;
 }
 
+function totalChunkBytes(sizes: ChunkSizes): number {
+  return Object.values(sizes).reduce<number>(
+    (bytes, chunk) => bytes + (typeof chunk === "number" ? chunk : chunk.size),
+    0
+  );
+}
+
 type SenderRow = {
   token_hash: string;
   max_bytes: number;
@@ -92,6 +103,9 @@ interface Subscriber {
 
 export class MailboxDurableObject extends DurableObject<Env> {
   private readonly subscribers = new Set<Subscriber>();
+  // Serialize fallback and commit per chunk. Track storage mutations for cleanup.
+  private readonly chunkOperations = new Map<string, Map<number, Promise<void> | null>>();
+  private readonly deletingTransfers = new Set<string>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -147,6 +161,44 @@ export class MailboxDurableObject extends DurableObject<Env> {
     const cfg = loadS3ConfigForProfile(this.env, profile);
     if (!cfg) return null;
     return new S3Client(cfg);
+  }
+
+  private async deleteStoredTransfer(
+    mailboxId: string | null,
+    transfer: TransferRow
+  ): Promise<void> {
+    const id = transfer.transfer_id;
+    const operations = this.chunkOperations.get(id);
+    this.deletingTransfers.add(id);
+    this.chunkOperations.delete(id);
+    try {
+      this.ctx.storage.sql.exec("DELETE FROM transfers_v2 WHERE transfer_id = ?", id);
+      // Removing the operation map prevents new mutations by in-flight handlers.
+      if (operations) await Promise.allSettled(operations.values());
+      const s3 = this.getS3ClientForProfile(parseStorageProfile(transfer.storage_profile));
+      if (mailboxId && s3) await this.deleteTransferObjects(s3, mailboxId, transfer);
+    } finally {
+      this.deletingTransfers.delete(id);
+    }
+  }
+
+  private async withChunkOperation(
+    transferId: string,
+    index: number,
+    run: (operations: Map<number, Promise<void> | null>) => Promise<Response>
+  ): Promise<Response> {
+    const operations = this.chunkOperations.get(transferId) ?? new Map<number, Promise<void> | null>();
+    if (operations.has(index)) return jsonErr(409, "upload_in_progress");
+    operations.set(index, null);
+    this.chunkOperations.set(transferId, operations);
+    try {
+      return await run(operations);
+    } finally {
+      operations.delete(index);
+      if (operations.size === 0 && this.chunkOperations.get(transferId) === operations) {
+        this.chunkOperations.delete(transferId);
+      }
+    }
   }
 
   private cfgInt(raw: string | undefined, fallback: number): number {
@@ -229,23 +281,8 @@ export class MailboxDurableObject extends DurableObject<Env> {
       .toArray();
 
     if (expiredTransfers.length > 0) {
-      this.ctx.storage.sql.exec("DELETE FROM transfers_v2 WHERE expires_at_ms <= ?", nowMs);
       const mbId = mailboxId ?? this.getMailboxId();
-      if (mbId) {
-        const clients = new Map<StorageProfile, S3Client | null>();
-        await Promise.all(
-          expiredTransfers.map((tr) => {
-            const profile = parseStorageProfile(tr.storage_profile);
-            let s3 = clients.get(profile);
-            if (s3 === undefined) {
-              s3 = this.getS3ClientForProfile(profile);
-              clients.set(profile, s3);
-            }
-            if (!s3) return Promise.resolve();
-            return this.deleteTransferObjects(s3, mbId, tr);
-          })
-        );
-      }
+      await Promise.all(expiredTransfers.map((tr) => this.deleteStoredTransfer(mbId, tr)));
     }
 
     this.ctx.storage.sql.exec("DELETE FROM nonces WHERE expires_at_ms <= ?", nowMs);
@@ -494,6 +531,15 @@ export class MailboxDurableObject extends DurableObject<Env> {
       return this.handleChunkUploadURL(request, mailboxId, parts[2], idx);
     }
 
+    if (parts.length === 6 && parts[1] === "transfers" && parts[3] === "chunks" && parts[5] === "upload" &&
+        url.origin === OFFICIAL_RELAY_ORIGIN) {
+      if (request.method !== "PUT") return jsonErr(405, "method_not_allowed");
+      if (!validTransferId(parts[2])) return jsonErr(400, "invalid_transfer_id");
+      const idx = parseChunkIndex(parts[4]);
+      if (idx === null) return jsonErr(400, "invalid_chunk_index");
+      return this.handleRelayChunkUpload(request, mailboxId, parts[2], idx);
+    }
+
     if (parts.length === 6 && parts[1] === "transfers" && parts[3] === "chunks" && parts[5] === "commit") {
       if (request.method !== "POST") return jsonErr(405, "method_not_allowed");
       if (!validTransferId(parts[2])) return jsonErr(400, "invalid_transfer_id");
@@ -618,10 +664,9 @@ export class MailboxDurableObject extends DurableObject<Env> {
 
     // Serialize transfer creation while Cloud commits the quota reservation.
     return this.ctx.blockConcurrencyWhile(async () => {
-      const existing = this.ctx.storage.sql
-        .exec<{ transfer_id: string }>("SELECT transfer_id FROM transfers_v2 WHERE transfer_id = ?", env.transfer_id)
-        .toArray();
-      if (existing.length > 0) return jsonErr(409, "already_exists");
+      if (this.deletingTransfers.has(env.transfer_id) || this.getTransfer(env.transfer_id)) {
+        return jsonErr(409, "already_exists");
+      }
 
       const activeCount = this.ctx.storage.sql.exec<{ c: number }>("SELECT COUNT(*) AS c FROM transfers_v2").one().c;
       if (activeCount >= this.maxTransfers) return jsonErr(429, "mailbox_full");
@@ -674,7 +719,72 @@ export class MailboxDurableObject extends DurableObject<Env> {
         max_chunk_bytes: MAX_CHUNK_SIZE + GCM_TAG_SIZE,
         upload_mode: "presigned",
         upload_urls: uploadUrls,
+        ...(new URL(request.url).origin === OFFICIAL_RELAY_ORIGIN && { relay_upload_fallback: true }),
       });
+    });
+  }
+
+  private async handleRelayChunkUpload(
+    request: Request,
+    mailboxId: string,
+    transferId: string,
+    index: number
+  ): Promise<Response> {
+    const tok = this.bearerToken(request);
+    if (!tok) return jsonErr(401, "unauthorized");
+    const sender = await this.authorizeSender(tok);
+    if (!sender) return jsonErr(403, "forbidden");
+
+    const tr = this.getTransfer(transferId);
+    if (!tr || tr.expires_at_ms <= Date.now()) return jsonErr(404, "not_found");
+    if (tr.sender_hash !== sender.token_hash) return jsonErr(403, "forbidden");
+    if (index >= tr.total_chunks) return jsonErr(400, "invalid_chunk_index");
+
+    const profile = parseStorageProfile(tr.storage_profile);
+    const s3 = hasS3Profile(this.env, profile) ? this.getS3ClientForProfile(profile) : null;
+    if (!s3) return jsonErr(503, "s3_not_configured");
+
+    return this.withChunkOperation(transferId, index, async (operations) => {
+      const limit = Math.min(tr.chunk_size + GCM_TAG_SIZE, tr.total_ciphertext_bytes);
+      const body = await readLimited(request.body, limit).catch(() => undefined);
+      if (body === undefined) return jsonErr(400, "invalid_body");
+      if (body === null) return jsonErr(413, "chunk_too_large");
+      if (body.byteLength === 0 || (tr.total_chunks === 1 && body.byteLength !== tr.total_ciphertext_bytes)) {
+        return jsonErr(400, "size_mismatch");
+      }
+
+      const envelope = JSON.parse(tr.envelope_json) as Envelope;
+      const expected = base64UrlDecode(envelope.chunk_hashes[index]);
+      const digest = await sha256(body);
+      if (!expected || !timingSafeEqualBytes(digest, expected)) return jsonErr(400, "chunk_hash_mismatch");
+
+      const latest = this.getTransfer(transferId);
+      if (!latest || latest.expires_at_ms <= Date.now() || this.chunkOperations.get(transferId) !== operations) {
+        return jsonErr(410, "gone");
+      }
+      const registered = this.ctx.storage.sql
+        .exec("SELECT 1 FROM senders WHERE token_hash = ?", sender.token_hash)
+        .toArray();
+      if (registered.length === 0) return jsonErr(403, "forbidden");
+      const bitmap = decodeBitmap(latest.available_b64, latest.total_chunks);
+      if (bitmap && hasBit(bitmap, index)) return new Response(null, { status: 204 });
+
+      // Count staged fallback bytes against the same budget as committed bytes.
+      // Keep the size after an ambiguous storage failure so retries cannot exceed it.
+      const sizes = readChunkSizes(latest);
+      sizes[index] = body.byteLength;
+      if (totalChunkBytes(sizes) > latest.total_ciphertext_bytes) return jsonErr(413, "payload_too_large");
+      this.saveChunkState(transferId, latest.available_b64, sizes);
+
+      const key = s3.objectKey(mailboxId, transferId, index);
+      const writing = s3.putObject(key, body, digest);
+      operations.set(index, writing);
+      const failed = await writing.then(() => false, () => true);
+      if (latest.expires_at_ms <= Date.now() || this.chunkOperations.get(transferId) !== operations) {
+        return jsonErr(410, "gone");
+      }
+      if (failed) return jsonErr(502, "storage_error");
+      return new Response(null, { status: 204 });
     });
   }
 
@@ -730,76 +840,78 @@ export class MailboxDurableObject extends DurableObject<Env> {
     const s3 = this.getS3ClientForProfile(parseStorageProfile(tr.storage_profile));
     if (!s3) return jsonErr(503, "s3_not_configured");
 
-    const key = s3.objectKey(mailboxId, transferId, index);
-    let meta;
-    try {
-      meta = await s3.headObject(key, nowMs);
-    } catch {
-      return jsonErr(502, "storage_error");
-    }
-    if (!meta) return jsonErr(404, "chunk_not_uploaded");
+    return this.withChunkOperation(transferId, index, async (operations) => {
+      const key = s3.objectKey(mailboxId, transferId, index);
+      let meta;
+      try {
+        meta = await s3.headObject(key, nowMs);
+      } catch {
+        return jsonErr(502, "storage_error");
+      }
+      if (!meta) return jsonErr(404, "chunk_not_uploaded");
 
-    const maxChunk = tr.chunk_size + GCM_TAG_SIZE;
-    if (meta.size <= 0 || meta.size > maxChunk || (tr.total_chunks === 1 && meta.size !== tr.total_ciphertext_bytes)) {
-      await this.removeRejectedChunk(s3, key, tr, index);
-      return meta.size > maxChunk ? jsonErr(413, "chunk_too_large") : jsonErr(400, "size_mismatch");
-    }
+      const beforeCopy = this.getCurrentTransfer(tr);
+      if (!beforeCopy || beforeCopy.expires_at_ms <= Date.now() ||
+          this.chunkOperations.get(transferId) !== operations) {
+        return jsonErr(410, "gone");
+      }
 
-    const beforeCopy = this.getCurrentTransfer(tr);
-    if (!beforeCopy) return jsonErr(410, "gone");
-    const committed = readChunkSizes(beforeCopy)[index];
-    if (committed && typeof committed !== "number" && committed.size === meta.size && committed.etag === meta.etag) {
-      return new Response(null, { status: 204 });
-    }
+      const maxChunk = beforeCopy.chunk_size + GCM_TAG_SIZE;
+      if (meta.size <= 0 || meta.size > maxChunk ||
+          (beforeCopy.total_chunks === 1 && meta.size !== beforeCopy.total_ciphertext_bytes)) {
+        const cleanup = this.removeRejectedChunk(s3, key, tr, index);
+        operations.set(index, cleanup);
+        await cleanup;
+        return meta.size > maxChunk ? jsonErr(413, "chunk_too_large") : jsonErr(400, "size_mismatch");
+      }
 
-    let snapshot: CommittedChunk;
-    try {
-      snapshot = await this.snapshotChunk(s3, key, meta);
-    } catch {
-      return jsonErr(502, "storage_error");
-    }
+      const committed = readChunkSizes(beforeCopy)[index];
+      if (committed && typeof committed !== "number" && committed.size === meta.size && committed.etag === meta.etag) {
+        return new Response(null, { status: 204 });
+      }
 
-    const latest = this.getCurrentTransfer(tr);
-    if (!latest) {
-      await s3.deleteObject(snapshot.key).catch(() => undefined);
-      return jsonErr(410, "gone");
-    }
-    const sizes = readChunkSizes(latest);
-    const previous = sizes[index];
-    if (previous && typeof previous !== "number" && previous.size === snapshot.size && previous.etag === snapshot.etag) {
-      await s3.deleteObject(snapshot.key).catch(() => undefined);
-      return new Response(null, { status: 204 });
-    }
-    sizes[index] = snapshot;
-    const total = Object.values(sizes).reduce<number>(
-      (bytes, chunk) => bytes + (typeof chunk === "number" ? chunk : chunk.size),
-      0
-    );
-    if (total > latest.total_ciphertext_bytes) {
-      await Promise.all([
-        this.removeRejectedChunk(s3, key, tr, index),
-        s3.deleteObject(snapshot.key).catch(() => undefined),
-      ]);
-      return jsonErr(413, "payload_too_large");
-    }
+      const committing = this.snapshotChunk(s3, key, meta).then(async (snapshot) => {
+        const latest = this.getCurrentTransfer(tr);
+        if (!latest || latest.expires_at_ms <= Date.now() || this.chunkOperations.get(transferId) !== operations) {
+          await s3.deleteObject(snapshot.key).catch(() => undefined);
+          return jsonErr(410, "gone");
+        }
+        const sizes = readChunkSizes(latest);
+        const previous = sizes[index];
+        if (previous && typeof previous !== "number" && previous.size === snapshot.size && previous.etag === snapshot.etag) {
+          await s3.deleteObject(snapshot.key).catch(() => undefined);
+          return new Response(null, { status: 204 });
+        }
 
-    const bm = decodeBitmap(latest.available_b64, latest.total_chunks) ?? newBitmap(latest.total_chunks);
-    setBit(bm, index);
-    const updatedB64 = encodeBitmap(bm);
-    this.saveChunkState(transferId, updatedB64, sizes);
+        sizes[index] = snapshot;
+        if (totalChunkBytes(sizes) > latest.total_ciphertext_bytes) {
+          await Promise.all([
+            this.removeRejectedChunk(s3, key, tr, index),
+            s3.deleteObject(snapshot.key).catch(() => undefined),
+          ]);
+          return jsonErr(413, "payload_too_large");
+        }
 
-    this.publishEvent({
-      event: "chunk_ready",
-      transfer_id: transferId,
-      chunk_index: index,
-      available_bitmap: updatedB64,
-      expires_at_ms: latest.expires_at_ms,
+        const bm = decodeBitmap(latest.available_b64, latest.total_chunks) ?? newBitmap(latest.total_chunks);
+        setBit(bm, index);
+        const updatedB64 = encodeBitmap(bm);
+        this.saveChunkState(transferId, updatedB64, sizes);
+        this.publishEvent({
+          event: "chunk_ready",
+          transfer_id: transferId,
+          chunk_index: index,
+          available_bitmap: updatedB64,
+          expires_at_ms: latest.expires_at_ms,
+        });
+
+        if (previous && typeof previous !== "number") {
+          await s3.deleteObject(previous.key).catch(() => undefined);
+        }
+        return new Response(null, { status: 204 });
+      }, () => jsonErr(502, "storage_error"));
+      operations.set(index, committing.then(() => undefined, () => undefined));
+      return committing;
     });
-
-    if (previous && typeof previous !== "number") {
-      await s3.deleteObject(previous.key).catch(() => undefined);
-    }
-    return new Response(null, { status: 204 });
   }
 
   private async handleListTransfers(request: Request, mailboxId: string): Promise<Response> {
@@ -884,13 +996,9 @@ export class MailboxDurableObject extends DurableObject<Env> {
     const authErr = await this.verifyOwner(request, mailboxId, body);
     if (authErr) return authErr;
 
-    const tr = this.getTransfer(transferId);
-    if (tr) {
-      this.ctx.storage.sql.exec("DELETE FROM transfers_v2 WHERE transfer_id = ?", transferId);
-      const s3 = this.getS3ClientForProfile(parseStorageProfile(tr.storage_profile));
-      if (s3) {
-        await this.deleteTransferObjects(s3, mailboxId, tr);
-      }
+    const transfer = this.getTransfer(transferId);
+    if (transfer) {
+      await this.deleteStoredTransfer(mailboxId, transfer);
       await this.scheduleNextAlarm();
     }
     return new Response(null, { status: 204 });
@@ -898,24 +1006,20 @@ export class MailboxDurableObject extends DurableObject<Env> {
 
   private async handleDeleteTransfer(request: Request, mailboxId: string, transferId: string): Promise<Response> {
     const tok = this.bearerToken(request);
+    let senderHash: string | undefined;
     if (tok) {
       const sender = await this.authorizeSender(tok);
       if (!sender) return jsonErr(403, "forbidden");
-
-      const tr = this.getTransfer(transferId);
-      if (tr && tr.sender_hash !== sender.token_hash) return jsonErr(403, "forbidden");
+      senderHash = sender.token_hash;
     } else {
       const authErr = await this.verifyOwner(request, mailboxId, new Uint8Array(0));
       if (authErr) return authErr;
     }
 
-    const tr = this.getTransfer(transferId);
-    if (tr) {
-      this.ctx.storage.sql.exec("DELETE FROM transfers_v2 WHERE transfer_id = ?", transferId);
-      const s3 = this.getS3ClientForProfile(parseStorageProfile(tr.storage_profile));
-      if (s3) {
-        await this.deleteTransferObjects(s3, mailboxId, tr);
-      }
+    const transfer = this.getTransfer(transferId);
+    if (transfer) {
+      if (senderHash && transfer.sender_hash !== senderHash) return jsonErr(403, "forbidden");
+      await this.deleteStoredTransfer(mailboxId, transfer);
       await this.scheduleNextAlarm();
     }
     return new Response(null, { status: 204 });
