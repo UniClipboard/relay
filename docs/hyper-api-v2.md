@@ -32,6 +32,12 @@ Unchanged from Hybrid Relay Contract 0035 (`vectors/hybrid-relay-v1.json`):
 | `POST /v1/relay/mailboxes/{mailbox_id}/transfers/{transfer_id}/ack` | Owner Auth | Mark transfer consumed and immediately `DeleteObject` all chunk objects in S3/COS/R2 (`204`). |
 | `DELETE /v1/relay/mailboxes/{mailbox_id}/transfers/{transfer_id}` | Owner Auth or `Bearer <token>` | Cancel/abort transfer and immediately `DeleteObject` all chunk objects in S3/COS/R2 (`204`). |
 
+## Optional Live Download Grant (Cloudflare Worker)
+
+When the Worker commits index `0` of a single-chunk transfer, its live owner-authenticated `chunk_ready` event may include `download_grant`. The grant uses the chunk download endpoint's response format with `method: "GET"`, a presigned `url`, a positive `expires_at_ms`, and the exact committed ciphertext `size`. Both paths sign the committed snapshot key using the transfer's stored storage profile and the same presign TTL limits.
+
+The Worker serves the event stream with `Cache-Control: no-store`. Stored events and `Last-Event-ID` replay omit the grant. If signing fails, the Worker sends the ordinary `chunk_ready` event and the commit still returns `204`. Clients can ignore the optional field. Use the authenticated chunk download endpoint for multi-chunk transfers, catch-up, and any missing or unusable grant.
+
 ## Client Security Requirements for Direct Object Storage
 
 1. **Strip all relay credentials**: Never send `Authorization`, `X-Unic-Relay-Key`, or `X-Unic-*` headers when calling a presigned S3/COS/R2 URL.
