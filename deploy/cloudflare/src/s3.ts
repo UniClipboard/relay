@@ -206,25 +206,44 @@ export class S3Client {
     throw new S3Error(`S3 DELETE failed with status ${resp.status}`, resp.status);
   }
 
-  async deleteTransfer(mailboxId: string, transferId: string, totalChunks: number): Promise<void> {
-    const tasks: Promise<void>[] = [];
-    for (let i = 0; i < totalChunks; i++) {
-      tasks.push(
-        this.deleteObject(this.objectKey(mailboxId, transferId, i)).catch(() => {
-          // Best-effort cleanup; bucket lifecycle rule serves as fallback.
-        })
-      );
+  async copyObject(sourceKey: string, targetKey: string, etag: string): Promise<void> {
+    const resp = await this.signedFetch("PUT", targetKey, Date.now(), {
+      "x-amz-copy-source": encodeUriPath(`/${this.cfg.bucket}/${sourceKey}`),
+      "x-amz-copy-source-if-match": `"${etag}"`,
+      "x-amz-metadata-directive": "REPLACE",
+    });
+    // CopyObject can report an error in a successful HTTP response.
+    if (!resp.ok || !/<CopyObjectResult(?:\s|\/?>)/.test(await resp.text())) {
+      throw new S3Error(`S3 COPY failed with status ${resp.status}`, resp.status);
     }
-    await Promise.all(tasks);
   }
 
-  private async signedFetch(method: "HEAD" | "DELETE", key: string, nowMs: number): Promise<Response> {
+  async deleteTransfer(
+    mailboxId: string, transferId: string, totalChunks: number, committedKeys: string[]
+  ): Promise<void> {
+    const uploadKeys = Array.from({ length: totalChunks }, (_, i) => this.objectKey(mailboxId, transferId, i));
+    await Promise.all(uploadKeys.concat(committedKeys).map((key) =>
+      this.deleteObject(key).catch(() => {
+        // Best-effort cleanup; bucket lifecycle rule serves as fallback.
+      })
+    ));
+  }
+
+  private async signedFetch(
+    method: "HEAD" | "DELETE" | "PUT", key: string, nowMs: number, extraHeaders: Record<string, string> = {}
+  ): Promise<Response> {
     const { amzDate, dateStamp } = formatAmzDate(nowMs);
     const scope = `${dateStamp}/${this.cfg.region}/s3/aws4_request`;
     const { scheme, host, canonicalUri } = this.objectAddress(this.endpointUrl, key);
 
-    const canonicalHeaders = `host:${host}\nx-amz-content-sha256:${EMPTY_PAYLOAD_SHA256}\nx-amz-date:${amzDate}\n`;
-    const signedHeaders = "host;x-amz-content-sha256;x-amz-date";
+    const headers: Record<string, string> = {
+      "x-amz-content-sha256": EMPTY_PAYLOAD_SHA256,
+      "x-amz-date": amzDate,
+      ...extraHeaders,
+    };
+    const headerNames = Object.keys(headers).sort();
+    const canonicalHeaders = `host:${host}\n` + headerNames.map((name) => `${name}:${headers[name]}\n`).join("");
+    const signedHeaders = ["host", ...headerNames].join(";");
     const canonicalRequest = [
       method,
       canonicalUri,
@@ -247,11 +266,7 @@ export class S3Client {
 
     return fetch(`${scheme}://${host}${canonicalUri}`, {
       method,
-      headers: {
-        "x-amz-date": amzDate,
-        "x-amz-content-sha256": EMPTY_PAYLOAD_SHA256,
-        Authorization: authHeader,
-      },
+      headers: { ...headers, Authorization: authHeader },
     });
   }
 
