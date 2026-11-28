@@ -100,6 +100,7 @@
         "S3_KEY_PREFIX": "mailboxes",
         "S3_PRESIGN_TTL_SEC": "300",
         "S3_CN_ENDPOINT": "https://cos.ap-guangzhou.myqcloud.com",
+        "S3_CN_PUBLIC_ENDPOINT": "https://cos.accelerate.myqcloud.com",
         "S3_CN_REGION": "ap-guangzhou",
         "S3_CN_BUCKET": "uniclipboard-hyper-chunks-1259447870",
         "S3_CN_FORCE_PATH_STYLE": "false",
