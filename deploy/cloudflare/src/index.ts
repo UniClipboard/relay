@@ -77,6 +77,9 @@ export default {
       if (authResult.maxTransferBytes && authResult.maxTransferBytes > 0) {
         forwardedHeaders.set("X-Internal-Max-Transfer-Bytes", String(authResult.maxTransferBytes));
       }
+      if (authResult.cloudKeyHash && request.method === "POST" && parts.length === 2 && parts[1] === "transfers") {
+        forwardedHeaders.set("X-Internal-Cloud-Key-Hash", authResult.cloudKeyHash);
+      }
 
       const mailboxId = parts[0];
       const stub = env.MAILBOX_DO.get(env.MAILBOX_DO.idFromName(mailboxId));

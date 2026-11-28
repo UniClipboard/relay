@@ -603,6 +603,7 @@ describe("Cloudflare Worker + Durable Object Direct-to-S3 Relay API", () => {
       subject: "usr_cloud_1",
       keyId: "key_cloud_1",
       maxTransferBytes: 12,
+      cloudKeyHash: allowHash,
     });
     expect(cloudCalls).toBe(1);
 
