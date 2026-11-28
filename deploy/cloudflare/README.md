@@ -65,6 +65,25 @@ The `env.production` block in `wrangler.jsonc` configures a single unified globa
 - **Per-Transfer Geo-Routed Dual S3 Storage** (`"global"` Cloudflare R2 + optional `"cn"` Tencent Cloud COS)
 - **Worker-Level Rate Limiting** (`RATE_LIMITER`, 180 req/min keyed by Cloud `subject` or `CF-Connecting-IP`)
 
+### Automatic Production Deployment
+
+Every push to `main`, including a pull request merge, runs the Worker checks
+and deploys the current `main` commit with `wrangler deploy --env production`.
+The workflow records the commit SHA on the Worker version, checks the public
+`/healthz` endpoint, and uploads its response as `relay-production-health`.
+
+Before the first deployment, create the `production` environment under GitHub
+**Settings → Environments**. Allow deployments from `main`. Add these
+environment secrets:
+
+- `CLOUDFLARE_ACCOUNT_ID` for the account that hosts `uniclipboard-hyper-relay`.
+- `CLOUDFLARE_API_TOKEN` with edit access to the existing production Worker and
+  Workers Routes write access scoped to `uniclipboard.app` for the custom domain.
+
+Set the runtime secrets in Cloudflare as described under [Production Secrets &
+Dry Run](#production-secrets--dry-run). To retry a failed deployment, rerun the
+failed job for the current `main` commit in GitHub Actions.
+
 ### Cloud API Key Verification
 
 When `CLOUD_VERIFY_URL` is configured, every `/v1/relay/*` request must include `X-Unic-Relay-Key`:
