@@ -3,7 +3,7 @@
 ## Design Principles
 
 1. **Headless Microservices Only**: No Web UI or admin dashboard.
-2. **Direct-to-Object-Storage Data Plane**: Ciphertext chunks travel directly between UniClipboard devices and configured S3-compatible storage (Tencent COS, Cloudflare R2, AWS S3, Aliyun OSS, MinIO) using short-lived SigV4 presigned URLs. The relay server handles only tiny JSON control messages, Ed25519 Owner Auth, 120s nonce anti-replay, SSE push, `HeadObject` size verification, and immediate `DeleteObject` cleanup.
+2. **Direct-to-Object-Storage Data Plane**: Clients use short-lived SigV4 presigned URLs to transfer ciphertext chunks with S3-compatible storage (Tencent COS, Cloudflare R2, AWS S3, Aliyun OSS, MinIO). The official Cloudflare Worker can also upload an authenticated ciphertext chunk to the storage profile selected at transfer creation. Both upload paths use the same `HeadObject` commit checks, SSE updates, and object cleanup.
 3. **Strict Separation of Relay Planes**:
    - **Hyper Relay (`cmd/hyper-relay`, `deploy/cloudflare`)**: Application-layer zero-knowledge E2EE control plane ([docs/hyper-api-v2.md](hyper-api-v2.md)).
    - **P2P Relay (`cmd/p2p-relay`, reserved)**: Future Tailcat DERP tunnel relay sharing `internal/auth`.

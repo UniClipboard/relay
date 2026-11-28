@@ -22,7 +22,7 @@ export default defineConfig({
           S3_CN_BUCKET: "unic-cn-bucket",
           S3_CN_ACCESS_KEY_ID: "AKCN",
           S3_CN_SECRET_ACCESS_KEY: "SKCN",
-          S3_CN_FORCE_PATH_STYLE: "true",
+          S3_CN_FORCE_PATH_STYLE: "false",
           S3_CN_KEY_PREFIX: "mailboxes",
           S3_CN_PRESIGN_TTL_SEC: "300",
         },

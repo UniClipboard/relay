@@ -25,8 +25,10 @@ import worker from "../src/index";
 import { configuredStorageProfiles, loadS3ConfigForProfile, S3Client } from "../src/s3";
 
 const ORIGIN = "http://example.com";
+const OFFICIAL_ORIGIN = "https://relay.uniclipboard.app";
 const MOCK_S3_ORIGIN = "https://mock-s3.example";
-const MOCK_CN_S3_ORIGIN = "https://mock-cos-cn.example";
+const MOCK_CN_S3_ENDPOINT = "https://mock-cos-cn.example";
+const MOCK_CN_S3_ORIGIN = "https://unic-cn-bucket.mock-cos-cn.example";
 const MOCK_CLOUD_VERIFY_URL = "https://mock-cloud.example/api/relay/v2/keys/verify";
 
 function ed25519SeedToPkcs8(seed: Uint8Array): Uint8Array {
@@ -80,6 +82,8 @@ describe("Cloudflare Worker + Durable Object Direct-to-S3 Relay API", () => {
   const mockCnObjects = new Map<string, Uint8Array>();
   let cloudHandler: ((req: Request) => Promise<Response>) | null = null;
   let onStorageDelete: ((path: string) => Promise<void>) | null = null;
+  let fallbackPut: ((req: Request) => Promise<Response | void>) | null = null;
+  let restoreQuotaBindings: (() => Promise<void>) | undefined;
 
   async function objectETag(obj: Uint8Array): Promise<string> {
     return `"${bytesToHex(await sha256(obj))}"`;
@@ -92,7 +96,11 @@ describe("Cloudflare Worker + Durable Object Direct-to-S3 Relay API", () => {
         if (!(req.headers.get("Authorization") ?? "").startsWith("AWS4-HMAC-SHA256 ")) {
           return new Response(null, { status: 403 });
         }
-        const source = store.get(copySource);
+        const bucketPrefix = "/unic-cn-bucket";
+        const sourcePath = url.origin === MOCK_CN_S3_ORIGIN && copySource.startsWith(`${bucketPrefix}/`)
+          ? copySource.slice(bucketPrefix.length)
+          : copySource;
+        const source = store.get(sourcePath);
         if (!source) return new Response(null, { status: 404 });
         if (req.headers.get("x-amz-copy-source-if-match") !== await objectETag(source)) {
           return new Response(null, { status: 412 });
@@ -100,10 +108,17 @@ describe("Cloudflare Worker + Durable Object Direct-to-S3 Relay API", () => {
         store.set(url.pathname, source.slice());
         return new Response("<CopyObjectResult></CopyObjectResult>");
       }
-      if (!url.searchParams.get("X-Amz-Signature")) {
-        return new Response("forbidden", { status: 403 });
-      }
       const obj = new Uint8Array(await req.arrayBuffer());
+      if (!url.searchParams.get("X-Amz-Signature")) {
+        if (!(req.headers.get("Authorization") ?? "").startsWith("AWS4-HMAC-SHA256 ")) {
+          return new Response(null, { status: 403 });
+        }
+        expect(req.headers.get("x-amz-content-sha256")).toBe(bytesToHex(await sha256(obj)));
+        expect(req.headers.has("X-Unic-Relay-Key")).toBe(false);
+        expect(req.redirect).toBe("manual");
+        const failure = await fallbackPut?.(req);
+        if (failure) return failure;
+      }
       store.set(url.pathname, obj);
       return new Response(null, { status: 200, headers: { ETag: await objectETag(obj) } });
     }
@@ -142,6 +157,7 @@ describe("Cloudflare Worker + Durable Object Direct-to-S3 Relay API", () => {
     mockCnObjects.clear();
     cloudHandler = null;
     onStorageDelete = null;
+    fallbackPut = null;
     clearCloudVerifyCache();
 
     const origFetch = globalThis.fetch.bind(globalThis);
@@ -161,8 +177,234 @@ describe("Cloudflare Worker + Durable Object Direct-to-S3 Relay API", () => {
     });
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await restoreQuotaBindings?.();
+    restoreQuotaBindings = undefined;
     vi.restoreAllMocks();
+  });
+
+  async function fallbackFixture(authEnv: Env = env, envelopeOverrides: Partial<typeof vector.transfer.envelope> = {}) {
+    const keyPair = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]) as CryptoKeyPair;
+    const owner = {
+      priv: keyPair.privateKey,
+      pub: new Uint8Array(await crypto.subtle.exportKey("raw", keyPair.publicKey) as ArrayBuffer),
+    };
+    const mailboxId = (await deriveMailboxId(OFFICIAL_ORIGIN, owner.pub))!;
+    const mailbox = `/v1/relay/mailboxes/${mailboxId}`;
+    const token = "test-fallback-delivery-token";
+    const otherToken = "test-other-delivery-token";
+    const relayKey = authEnv.CLOUD_VERIFY_URL ? "uc_live_test_fallback_key" : null;
+    const relay = (path: string, init: RequestInit, country = "US", origin = OFFICIAL_ORIGIN) => {
+      const headers = new Headers(init.headers);
+      if (relayKey && !headers.has("X-Unic-Relay-Key")) headers.set("X-Unic-Relay-Key", relayKey);
+      return worker.fetch(withCfCountry(new Request(`${origin}${path}`, { ...init, headers }), country), authEnv);
+    };
+    const ownerRequest = async (method: string, path: string) =>
+      relay(path, {
+        method,
+        headers: await signOwnerHeaders(owner, method, path, new Uint8Array(0), crypto.randomUUID(), OFFICIAL_ORIGIN),
+      });
+    for (const registered of [token, otherToken]) {
+      const senderPath = `${mailbox}/senders/${await tokenHashHex(registered)}`;
+      expect((await ownerRequest("PUT", senderPath)).status).toBe(204);
+    }
+    const auth = { Authorization: `Bearer ${token}` };
+    const envelope = {
+      ...vector.transfer.envelope,
+      created_ms: Date.now(),
+      expires_ms: Date.now() + 60_000,
+      ...envelopeOverrides,
+    };
+    const transfer = `${mailbox}/transfers/${envelope.transfer_id}`;
+    const chunk = `${transfer}/chunks/0`;
+    const ciphertext = hexToBytes(vector.transfer.ciphertexts_hex[0]);
+    const upload = (body: Uint8Array = ciphertext, headers: HeadersInit = auth) =>
+      relay(`${chunk}/upload`, { method: "PUT", headers, body });
+    const create = (country = "US", origin = OFFICIAL_ORIGIN) =>
+      relay(
+        `${mailbox}/transfers`,
+        { method: "POST", headers: auth, body: JSON.stringify(envelope) },
+        country,
+        origin
+      );
+    const stub = env.MAILBOX_DO.get(env.MAILBOX_DO.idFromName(mailboxId));
+    return { relay, ownerRequest, auth, envelope, mailbox, transfer, chunk, ciphertext, upload, create, otherToken, stub };
+  }
+
+  it.each(["US", "CN"])("stages and commits relay fallback through the persisted %s profile", async (country) => {
+    const cloudEnv = { ...env, CLOUD_VERIFY_URL: MOCK_CLOUD_VERIFY_URL, CLOUD_VERIFY_SECRET: "test-cloud-secret" };
+    const reservations: number[] = [];
+    cloudHandler = async (req) => {
+      const body = await req.json<{ reservation?: { bytes: number } }>();
+      if (body.reservation) {
+        reservations.push(body.reservation.bytes);
+        return Response.json({ reserved: true });
+      }
+      return Response.json({ allowed: true });
+    };
+    const fixture = await fallbackFixture(cloudEnv);
+    restoreQuotaBindings = () => runInDurableObject(fixture.stub, (instance) => {
+      const bindings = (instance as unknown as { env: Env }).env;
+      delete bindings.CLOUD_VERIFY_URL;
+      delete bindings.CLOUD_VERIFY_SECRET;
+    });
+    await runInDurableObject(fixture.stub, (instance) => {
+      const bindings = (instance as unknown as { env: Env }).env;
+      bindings.CLOUD_VERIFY_URL = cloudEnv.CLOUD_VERIFY_URL;
+      bindings.CLOUD_VERIFY_SECRET = cloudEnv.CLOUD_VERIFY_SECRET;
+    });
+    const created = await fixture.create(country);
+    expect(created.status).toBe(200);
+    const grant = await created.json<{
+      upload_mode: string;
+      relay_upload_fallback: boolean;
+      upload_urls: Array<{ url: string }>;
+    }>();
+    expect(grant.upload_mode).toBe("presigned");
+    expect(grant.relay_upload_fallback).toBe(true);
+
+    const staged = country === "CN" ? mockCnObjects : mockGlobalObjects;
+    const otherStore = country === "CN" ? mockGlobalObjects : mockCnObjects;
+    const commitPath = `${fixture.chunk}/commit`;
+    const commit = () => fixture.relay(commitPath, { method: "POST", headers: fixture.auth });
+    // Model a pre-dial failure by withholding the first storage PUT.
+    expect((await commit()).status).toBe(404);
+    expect(staged.size).toBe(0);
+    expect((await fixture.upload(fixture.ciphertext, {})).status).toBe(401);
+    expect((await fixture.upload(fixture.ciphertext, { Authorization: `Bearer ${fixture.otherToken}` })).status).toBe(403);
+    expect((await fixture.upload(fixture.ciphertext, { ...fixture.auth, "X-Unic-Relay-Key": "" })).status).toBe(401);
+    expect((await fixture.upload(new Uint8Array(fixture.envelope.total_ciphertext_bytes + 1))).status).toBe(413);
+    expect((await fixture.upload(new Uint8Array(fixture.ciphertext.length))).status).toBe(400);
+    expect(staged.size).toBe(0);
+
+    fallbackPut = async () => new Response(null, { status: 503 });
+    const failedUpload = await fixture.upload();
+    expect(failedUpload.status).toBe(502);
+    expect(await failedUpload.json()).toEqual({ error: "storage_error" });
+    fallbackPut = async () => new Response(null, { status: 307, headers: { Location: MOCK_CN_S3_ORIGIN } });
+    expect((await fixture.upload()).status).toBe(502);
+    expect(staged.size).toBe(0);
+    let fallbackWrites = 0;
+    fallbackPut = async () => { fallbackWrites++; };
+    expect((await fixture.upload()).status).toBe(204);
+    expect((await fixture.upload()).status).toBe(204);
+    expect(staged.size).toBe(1);
+    expect(otherStore.size).toBe(0);
+    expect((await fixture.ownerRequest("GET", fixture.chunk)).status).toBe(404);
+
+    expect((await commit()).status).toBe(204);
+    expect((await commit()).status).toBe(204);
+    expect((await fixture.upload()).status).toBe(204);
+    expect(fallbackWrites).toBe(2);
+    const overwrite = await fetch(grant.upload_urls[0].url, {
+      method: "PUT",
+      body: new Uint8Array(fixture.ciphertext.length),
+    });
+    expect(overwrite.status).toBe(200);
+    const download = await fixture.ownerRequest("GET", fixture.chunk);
+    expect(download.status).toBe(200);
+    const downloadGrant = await download.json<{ url: string }>();
+    const bytes = new Uint8Array(await (await fetch(downloadGrant.url)).arrayBuffer());
+    expect(bytes).toEqual(fixture.ciphertext);
+
+    const direct = await fetch(grant.upload_urls[1].url, {
+      method: "PUT",
+      body: hexToBytes(vector.transfer.ciphertexts_hex[1]),
+    });
+    expect(direct.status).toBe(200);
+    expect((await fixture.relay(`${fixture.transfer}/chunks/1/commit`, { method: "POST", headers: fixture.auth })).status)
+      .toBe(204);
+    const events = await runInDurableObject(fixture.stub, (_instance, state) =>
+      state.storage.sql.exec<{ event: string }>("SELECT event FROM events ORDER BY id").toArray().map((row) => row.event)
+    );
+    expect(events).toEqual(["transfer_announced", "chunk_ready", "chunk_ready"]);
+    expect(reservations).toEqual([fixture.envelope.total_ciphertext_bytes]);
+    expect((await fixture.ownerRequest("POST", `${fixture.transfer}/ack`)).status).toBe(204);
+    expect(staged.size).toBe(0);
+  });
+
+  it("keeps relay upload fallback disabled on other origins", async () => {
+    const fixture = await fallbackFixture();
+    const created = await fixture.create("US", ORIGIN);
+    expect(created.status).toBe(200);
+    const response = await created.json<{ relay_upload_fallback?: boolean }>();
+    expect(response.relay_upload_fallback).toBeUndefined();
+    const denied = await fixture.relay(`${fixture.chunk}/upload`, {
+      method: "PUT",
+      headers: { ...fixture.auth, "X-Forwarded-Host": new URL(OFFICIAL_ORIGIN).host },
+      body: fixture.ciphertext,
+    }, "US", ORIGIN);
+    expect(denied.status).toBe(404);
+    expect(mockGlobalObjects.size).toBe(0);
+  });
+
+  it("enforces the original budget before committing fallback chunks", async () => {
+    const fixture = await fallbackFixture(env, { total_ciphertext_bytes: 60 });
+    expect((await fixture.create()).status).toBe(200);
+    expect((await fixture.upload()).status).toBe(204);
+    const overflow = await fixture.relay(`${fixture.transfer}/chunks/1/upload`, {
+      method: "PUT",
+      headers: fixture.auth,
+      body: hexToBytes(vector.transfer.ciphertexts_hex[1]),
+    });
+    expect(overflow.status).toBe(413);
+    expect(await overflow.json()).toEqual({ error: "payload_too_large" });
+    expect(mockGlobalObjects.size).toBe(1);
+    expect((await fixture.relay(fixture.transfer, { method: "DELETE", headers: fixture.auth })).status).toBe(204);
+    expect(mockGlobalObjects.size).toBe(0);
+  });
+
+  it("falls back for a single ciphertext chunk", async () => {
+    const ciphertextSize = vector.transfer.ciphertexts_hex[0].length / 2;
+    const fixture = await fallbackFixture(env, {
+      chunk_size: ciphertextSize - 16,
+      total_chunks: 1,
+      total_ciphertext_bytes: ciphertextSize,
+      chunk_hashes: [vector.transfer.envelope.chunk_hashes[0]],
+    });
+    expect((await fixture.create()).status).toBe(200);
+    expect((await fixture.upload(fixture.ciphertext.subarray(0, ciphertextSize - 1))).status).toBe(400);
+    expect((await fixture.upload()).status).toBe(204);
+    expect((await fixture.relay(`${fixture.chunk}/commit`, { method: "POST", headers: fixture.auth })).status).toBe(204);
+    expect((await fixture.ownerRequest("POST", `${fixture.transfer}/ack`)).status).toBe(204);
+    expect(mockGlobalObjects.size).toBe(0);
+  });
+
+  it.each(["cancel", "expire"])("cleans up a fallback storage PUT that finishes after %s", async (action) => {
+    const fixture = await fallbackFixture();
+    expect((await fixture.create()).status).toBe(200);
+    let started = false;
+    let released = false;
+    fallbackPut = async () => {
+      started = true;
+      while (!released) await scheduler.wait(5);
+    };
+    const uploading = fixture.upload();
+    try {
+      await vi.waitFor(() => expect(started).toBe(true));
+      expect((await fixture.upload()).status).toBe(409);
+      if (action === "expire") {
+        await runInDurableObject(fixture.stub, (_instance, state) => {
+          state.storage.sql.exec("UPDATE transfers_v2 SET expires_at_ms = ?", Date.now() - 1);
+        });
+      }
+      const cleaning = action === "expire"
+        ? runDurableObjectAlarm(fixture.stub)
+        : fixture.relay(fixture.transfer, { method: "DELETE", headers: fixture.auth });
+      await vi.waitFor(async () => {
+        const listed = await fixture.ownerRequest("GET", `${fixture.mailbox}/transfers`);
+        expect((await listed.json<{ transfers: unknown[] }>()).transfers).toHaveLength(0);
+      });
+      expect((await fixture.create()).status).toBe(409);
+      released = true;
+      expect((await uploading).status).toBe(410);
+      const result = await cleaning;
+      expect(result instanceof Response ? result.status : result).toBe(action === "expire" ? true : 204);
+      expect(mockGlobalObjects.size).toBe(0);
+    } finally {
+      released = true;
+      await uploading;
+    }
   });
 
   it("serves /healthz with storage=s3-direct and storage_profiles without authentication", async () => {
@@ -213,7 +455,7 @@ describe("Cloudflare Worker + Durable Object Direct-to-S3 Relay API", () => {
       S3_SECRET_ACCESS_KEY: undefined,
     };
     expect(configuredStorageProfiles(cnOnly)).toEqual(["cn"]);
-    expect(loadS3ConfigForProfile(cnOnly, "global")?.endpoint).toBe(MOCK_CN_S3_ORIGIN);
+    expect(loadS3ConfigForProfile(cnOnly, "global")?.endpoint).toBe(MOCK_CN_S3_ENDPOINT);
   });
 
   it("generates valid SigV4 presigned URLs for Tencent COS virtual-host addressing", async () => {

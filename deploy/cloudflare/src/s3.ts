@@ -12,6 +12,7 @@ const EMPTY_PAYLOAD_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca4
 const UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD";
 const DEFAULT_PRESIGN_TTL_SEC = 300;
 const MAX_PRESIGN_TTL_SEC = 1800;
+const PUT_TIMEOUT_MS = 30_000;
 
 export type StorageProfile = "global" | "cn";
 
@@ -198,6 +199,14 @@ export class S3Client {
     };
   }
 
+  async putObject(key: string, body: Uint8Array, digest: Uint8Array, nowMs = Date.now()): Promise<void> {
+    const resp = await this.signedFetch("PUT", key, nowMs, { "x-amz-content-sha256": bytesToHex(digest) }, body);
+    await resp.body?.cancel();
+    if (!resp.ok) {
+      throw new S3Error(`S3 PUT failed with status ${resp.status}`, resp.status);
+    }
+  }
+
   async deleteObject(key: string, nowMs = Date.now()): Promise<void> {
     const resp = await this.signedFetch("DELETE", key, nowMs);
     if (resp.status === 404 || resp.ok) {
@@ -230,7 +239,11 @@ export class S3Client {
   }
 
   private async signedFetch(
-    method: "HEAD" | "DELETE" | "PUT", key: string, nowMs: number, extraHeaders: Record<string, string> = {}
+    method: "HEAD" | "DELETE" | "PUT",
+    key: string,
+    nowMs: number,
+    extraHeaders: Record<string, string> = {},
+    body?: Uint8Array
   ): Promise<Response> {
     const { amzDate, dateStamp } = formatAmzDate(nowMs);
     const scope = `${dateStamp}/${this.cfg.region}/s3/aws4_request`;
@@ -250,7 +263,7 @@ export class S3Client {
       "",
       canonicalHeaders,
       signedHeaders,
-      EMPTY_PAYLOAD_SHA256,
+      headers["x-amz-content-sha256"],
     ].join("\n");
 
     const stringToSign = [
@@ -267,6 +280,7 @@ export class S3Client {
     return fetch(`${scheme}://${host}${canonicalUri}`, {
       method,
       headers: { ...headers, Authorization: authHeader },
+      ...(body && { body, redirect: "manual", signal: AbortSignal.timeout(PUT_TIMEOUT_MS) }),
     });
   }
 
