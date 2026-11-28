@@ -33,6 +33,7 @@ export interface AccessKeyResult {
   subject?: string;
   keyId?: string;
   maxTransferBytes?: number;
+  cloudKeyHash?: string;
 }
 
 interface CloudVerifyCacheEntry {
@@ -194,9 +195,53 @@ export async function verifyCloudAccessKey(
     subject,
     keyId,
     maxTransferBytes,
+    cloudKeyHash: keyHash,
   };
   setCachedCloudDecision(cacheKey, allowed, nowMs + cacheTtlSec * 1000, nowMs);
   return allowed;
+}
+
+export async function reserveCloudTransfer(
+  env: AuthEnv,
+  keyHash: string,
+  bytes: number,
+): Promise<Response | null> {
+  const unavailable = () => Response.json({ error: "quota_unavailable" }, { status: 503 });
+  const verifyUrl = env.CLOUD_VERIFY_URL?.trim();
+  const verifySecret = env.CLOUD_VERIFY_SECRET?.trim();
+  if (!verifyUrl || !verifySecret) return unavailable();
+
+  try {
+    const response = await fetch(verifyUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${verifySecret}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        key_hash: keyHash,
+        reservation: { id: crypto.randomUUID(), bytes },
+      }),
+      signal: AbortSignal.timeout(CLOUD_VERIFY_TIMEOUT_MS),
+    });
+    const result = await response.json() as { reserved?: unknown; error?: unknown };
+    if (response.ok && result?.reserved === true) return null;
+    if (response.status === 429 && result?.error === "monthly_quota_exceeded") {
+      const headers = new Headers();
+      const retryAfter = response.headers.get("Retry-After");
+      if (retryAfter) headers.set("Retry-After", retryAfter);
+      return Response.json({ error: result.error }, { status: 429, headers });
+    }
+    if (response.status === 401 && result?.error === "invalid_or_revoked") {
+      return Response.json({ error: "unauthorized" }, { status: 401 });
+    }
+    if (response.status === 413 && result?.error === "transfer_too_large") {
+      return Response.json({ error: "payload_too_large" }, { status: 413 });
+    }
+  } catch {
+    return unavailable();
+  }
+  return unavailable();
 }
 
 export function parseAllowedPubKeys(csv: string | undefined): Set<string> | null {

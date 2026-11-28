@@ -74,7 +74,15 @@ When `CLOUD_VERIFY_URL` is configured, every `/v1/relay/*` request must include 
 - `CLOUD_VERIFY_CACHE_TTL_SEC` *(optional, default `60`)*: Positive verification cache TTL in seconds (negative decisions are cached for 10 seconds)
 - `RELAY_ACCESS_KEY` *(optional secret)*: Static fallback key checked in constant time before calling Cloud
 
-The Worker hashes the presented key locally with SHA-256 and sends only `{"key_hash":"<hex>"}` to `CLOUD_VERIFY_URL` — raw API keys are never transmitted or logged. Per-key `max_transfer_bytes` limits returned by Cloud are enforced alongside server and sender caps.
+The Worker hashes the presented key locally with SHA-256 and sends
+`{"key_hash":"<hex>"}` to `CLOUD_VERIFY_URL` for authentication. Per-key
+`max_transfer_bytes` limits apply alongside server and sender caps.
+For each new transfer authenticated with a Cloud key, the Worker also sends
+a reservation containing its own request ID and the envelope's ciphertext byte
+count. Cloud enforces the per-account 100 MiB UTC calendar-month quota. The
+Worker returns `429 monthly_quota_exceeded` with `Retry-After` when Cloud denies
+the reservation. Deploy the compatible Cloud verifier and its migration before
+deploying this Worker.
 
 ### Geo-Routed Dual S3 Storage (`global` R2 + `cn` COS)
 

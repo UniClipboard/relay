@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import { DurableObject } from "cloudflare:workers";
-import { isPubKeyAllowed, parseAllowedPubKeys } from "./auth";
+import { isPubKeyAllowed, parseAllowedPubKeys, reserveCloudTransfer } from "./auth";
 import {
   base64UrlDecode,
   decodeBitmap,
@@ -548,56 +548,65 @@ export class MailboxDurableObject extends DurableObject<Env> {
 
     await this.sweepExpired(mailboxId, nowMs);
 
-    const existing = this.ctx.storage.sql
-      .exec<{ transfer_id: string }>("SELECT transfer_id FROM transfers_v2 WHERE transfer_id = ?", env.transfer_id)
-      .toArray();
-    if (existing.length > 0) return jsonErr(409, "already_exists");
+    // Serialize transfer creation while Cloud commits the quota reservation.
+    return this.ctx.blockConcurrencyWhile(async () => {
+      const existing = this.ctx.storage.sql
+        .exec<{ transfer_id: string }>("SELECT transfer_id FROM transfers_v2 WHERE transfer_id = ?", env.transfer_id)
+        .toArray();
+      if (existing.length > 0) return jsonErr(409, "already_exists");
 
-    const activeCount = this.ctx.storage.sql.exec<{ c: number }>("SELECT COUNT(*) AS c FROM transfers_v2").one().c;
-    if (activeCount >= this.maxTransfers) return jsonErr(429, "mailbox_full");
+      const activeCount = this.ctx.storage.sql.exec<{ c: number }>("SELECT COUNT(*) AS c FROM transfers_v2").one().c;
+      if (activeCount >= this.maxTransfers) return jsonErr(429, "mailbox_full");
 
-    const inlineCount = Math.min(env.total_chunks, MAX_INLINE_UPLOAD_URLS);
-    const presignTtl = this.presignTtlFor(nowMs, validated.expiresAtMs, s3.presignTtlSec);
-    const uploadUrls = await Promise.all(
-      Array.from({ length: inlineCount }, async (_, i) => {
-        const signed = await s3.presignPut(s3.objectKey(mailboxId, env.transfer_id, i), presignTtl, nowMs);
-        return { index: i, ...signed };
-      })
-    );
+      const inlineCount = Math.min(env.total_chunks, MAX_INLINE_UPLOAD_URLS);
+      const presignTtl = this.presignTtlFor(nowMs, validated.expiresAtMs, s3.presignTtlSec);
+      const uploadUrls = await Promise.all(
+        Array.from({ length: inlineCount }, async (_, i) => {
+          const signed = await s3.presignPut(s3.objectKey(mailboxId, env.transfer_id, i), presignTtl, nowMs);
+          return { index: i, ...signed };
+        })
+      );
 
-    const availableB64 = encodeBitmap(newBitmap(env.total_chunks));
-    this.ctx.storage.sql.exec(
-      `INSERT INTO transfers_v2 (
-        transfer_id, sender_hash, envelope_json, chunk_sizes_json,
-        available_b64, total_chunks, chunk_size, total_ciphertext_bytes, expires_at_ms, storage_profile
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      env.transfer_id,
-      sender.token_hash,
-      JSON.stringify(env),
-      "{}",
-      availableB64,
-      env.total_chunks,
-      env.chunk_size,
-      env.total_ciphertext_bytes,
-      validated.expiresAtMs,
-      storageProfile
-    );
-    await this.scheduleNextAlarm();
+      const cloudKeyHash = request.headers.get("X-Internal-Cloud-Key-Hash");
+      if (cloudKeyHash) {
+        const denied = await reserveCloudTransfer(this.env, cloudKeyHash, env.total_ciphertext_bytes);
+        if (denied) return denied;
+      }
 
-    this.publishEvent({
-      event: "transfer_announced",
-      transfer_id: env.transfer_id,
-      envelope: env,
-      available_bitmap: availableB64,
-      expires_at_ms: validated.expiresAtMs,
-    });
+      const availableB64 = encodeBitmap(newBitmap(env.total_chunks));
+      this.ctx.storage.sql.exec(
+        `INSERT INTO transfers_v2 (
+          transfer_id, sender_hash, envelope_json, chunk_sizes_json,
+          available_b64, total_chunks, chunk_size, total_ciphertext_bytes, expires_at_ms, storage_profile
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        env.transfer_id,
+        sender.token_hash,
+        JSON.stringify(env),
+        "{}",
+        availableB64,
+        env.total_chunks,
+        env.chunk_size,
+        env.total_ciphertext_bytes,
+        validated.expiresAtMs,
+        storageProfile
+      );
+      await this.scheduleNextAlarm();
 
-    return Response.json({
-      transfer_id: env.transfer_id,
-      expires_at_ms: validated.expiresAtMs,
-      max_chunk_bytes: MAX_CHUNK_SIZE + GCM_TAG_SIZE,
-      upload_mode: "presigned",
-      upload_urls: uploadUrls,
+      this.publishEvent({
+        event: "transfer_announced",
+        transfer_id: env.transfer_id,
+        envelope: env,
+        available_bitmap: availableB64,
+        expires_at_ms: validated.expiresAtMs,
+      });
+
+      return Response.json({
+        transfer_id: env.transfer_id,
+        expires_at_ms: validated.expiresAtMs,
+        max_chunk_bytes: MAX_CHUNK_SIZE + GCM_TAG_SIZE,
+        upload_mode: "presigned",
+        upload_urls: uploadUrls,
+      });
     });
   }
 
@@ -687,6 +696,11 @@ export class MailboxDurableObject extends DurableObject<Env> {
     const updatedB64 = encodeBitmap(bm);
     const sizes = JSON.parse(latest.chunk_sizes_json) as Record<string, number>;
     sizes[String(index)] = meta.size;
+    const total = Object.values(sizes).reduce((bytes, size) => bytes + size, 0);
+    if (total > latest.total_ciphertext_bytes) {
+      await s3.deleteObject(key).catch(() => undefined);
+      return jsonErr(413, "payload_too_large");
+    }
 
     this.ctx.storage.sql.exec(
       "UPDATE transfers_v2 SET available_b64 = ?, chunk_sizes_json = ? WHERE transfer_id = ?",
